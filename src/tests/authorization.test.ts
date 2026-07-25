@@ -14,6 +14,21 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
 describe("authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    // `initialize()` derives `isRemote` from ambient env (SSH_*, NO_BROWSER,
+    // CLAUDE_CODE_REMOTE). On an SSH/CI host those are set, which silently
+    // flipped the local-auth cases into the remote branch (only `claude-login`,
+    // no `claude-ai-login`/`console-login`) and made these tests pass only on a
+    // non-SSH laptop. Pin a deterministic non-remote baseline; the remote cases
+    // below re-set their specific var explicitly.
+    for (const key of [
+      "NO_BROWSER",
+      "SSH_CONNECTION",
+      "SSH_CLIENT",
+      "SSH_TTY",
+      "CLAUDE_CODE_REMOTE",
+    ]) {
+      vi.stubEnv(key, "");
+    }
     // Set here (not in vi.fn(impl) at hoist time) so the helper import is
     // available; afterEach's resetAllMocks clears it, beforeEach re-sets it.
     mockQuery.mockImplementation(() =>
@@ -38,6 +53,7 @@ describe("authorization", () => {
     vi.useRealTimers();
 
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.resetAllMocks();
   });
 
