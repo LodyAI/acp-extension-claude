@@ -210,6 +210,67 @@ const TURN_NO_RESULT_MESSAGE =
  *  agreed ACP steering wire protocol; advertised to clients via the top-level
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
+export const LODY_FORK_POINT_BEFORE_ACTIVE_TURN_METHOD =
+  "_lody/session/fork-point-before-active-turn";
+
+type ForkPointBeforeActiveTurnRequest = {
+  sessionId: string;
+};
+
+type ForkPointBeforeActiveTurnResponse = {
+  forkPoint: string;
+};
+
+function parseForkPointBeforeActiveTurnRequest(params: unknown): ForkPointBeforeActiveTurnRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "fork point params must be an object");
+  }
+  const { sessionId } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, "fork point params require a sessionId");
+  }
+  return { sessionId };
+}
+
+function getLodyForkPoint(meta: unknown): string | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const lody = (meta as Record<string, unknown>).lody;
+  if (!lody || typeof lody !== "object") return undefined;
+  const forkPoint = (lody as Record<string, unknown>).forkPoint;
+  return typeof forkPoint === "string" && forkPoint.length > 0 ? forkPoint : undefined;
+}
+
+export function findClaudeForkPointBeforePrompt(
+  messages: ReadonlyArray<unknown>,
+  promptUuid: string,
+): string | null {
+  const promptIndex = messages.findIndex(
+    (message) =>
+      !!message &&
+      typeof message === "object" &&
+      (message as { type?: unknown }).type === "user" &&
+      (message as { uuid?: unknown }).uuid === promptUuid,
+  );
+  if (promptIndex < 0) return null;
+  for (let index = promptIndex - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (!message || typeof message !== "object") continue;
+    const candidate = message as {
+      type?: unknown;
+      uuid?: unknown;
+      parent_tool_use_id?: unknown;
+    };
+    if (
+      candidate.type === "assistant" &&
+      candidate.parent_tool_use_id == null &&
+      typeof candidate.uuid === "string" &&
+      candidate.uuid.length > 0
+    ) {
+      return candidate.uuid;
+    }
+  }
+  return null;
+}
 
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
@@ -1446,6 +1507,9 @@ export class ClaudeAcpAgent {
               appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
             },
           },
+          lody: {
+            forkPointBeforeActiveTurn: { version: 1 },
+          },
         },
         promptCapabilities: {
           image: true,
@@ -1507,6 +1571,7 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    const forkPoint = getLodyForkPoint(params._meta);
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1517,6 +1582,7 @@ export class ClaudeAcpAgent {
       {
         resume: params.sessionId,
         forkSession: true,
+        resumeSessionAt: forkPoint,
       },
     );
     // Needs to happen after we return the session
@@ -1524,6 +1590,23 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
+  }
+
+  async resolveForkPointBeforeActiveTurn(
+    params: ForkPointBeforeActiveTurnRequest,
+  ): Promise<ForkPointBeforeActiveTurnResponse> {
+    const session = this.sessions[params.sessionId];
+    const activeTurn =
+      session?.activeTurn ?? session?.turnQueue?.find((turn) => !turn.settled) ?? null;
+    if (!activeTurn) {
+      throw RequestError.invalidRequest("Session has no active turn");
+    }
+    const messages = await getSessionMessages(params.sessionId);
+    const forkPoint = findClaudeForkPointBeforePrompt(messages, activeTurn.promptUuid);
+    if (!forkPoint) {
+      throw RequestError.invalidRequest("No assistant turn exists before the active turn");
+    }
+    return { forkPoint };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -5280,7 +5363,7 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: { resume?: string; forkSession?: boolean; resumeSessionAt?: string } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -7608,6 +7691,11 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<ForkPointBeforeActiveTurnRequest, ForkPointBeforeActiveTurnResponse>(
+      LODY_FORK_POINT_BEFORE_ACTIVE_TURN_METHOD,
+      { parse: parseForkPointBeforeActiveTurnRequest },
+      (ctx) => agent.resolveForkPointBeforeActiveTurn(ctx.params),
     )
     .connect(stream);
 

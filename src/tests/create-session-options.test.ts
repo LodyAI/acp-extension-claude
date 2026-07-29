@@ -112,6 +112,23 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
+  it("forks through the provider boundary supplied by Lody", async () => {
+    await agent.unstable_forkSession({
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        lody: {
+          forkPoint: "22222222-2222-4222-8222-222222222222",
+        },
+      },
+    });
+
+    expect(capturedOptions?.resume).toBe("11111111-1111-4111-8111-111111111111");
+    expect(capturedOptions?.forkSession).toBe(true);
+    expect(capturedOptions?.resumeSessionAt).toBe("22222222-2222-4222-8222-222222222222");
+  });
+
   it("sets tools to empty array when disableBuiltInTools is true", async () => {
     await agent.newSession({
       cwd: process.cwd(),
