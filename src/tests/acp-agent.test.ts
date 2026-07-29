@@ -6797,8 +6797,9 @@ describe("result origin handling", () => {
 
   it("user-prompted result with max_tokens still sets stopReason", async () => {
     const { agent } = createMockAgentWithCapture();
+    const assistant = createAssistantMessage();
     injectSession(agent, [
-      createAssistantMessage(),
+      assistant,
       createResult({
         stop_reason: "max_tokens",
         origin: { kind: "channel", server: "acp" },
@@ -6812,6 +6813,9 @@ describe("result origin handling", () => {
     });
 
     expect(response.stopReason).toBe("max_tokens");
+    expect(response._meta).toMatchObject({
+      lody: { forkPoint: assistant.uuid },
+    });
   });
 });
 

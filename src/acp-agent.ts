@@ -240,6 +240,26 @@ function getLodyForkPoint(meta: unknown): string | undefined {
   return typeof forkPoint === "string" && forkPoint.length > 0 ? forkPoint : undefined;
 }
 
+function withLodyForkPoint(
+  response: PromptResponse,
+  forkPoint: string | undefined,
+): PromptResponse {
+  if (!forkPoint) return response;
+  const currentMeta = response._meta && typeof response._meta === "object" ? response._meta : {};
+  const currentLody =
+    currentMeta.lody && typeof currentMeta.lody === "object" ? currentMeta.lody : {};
+  return {
+    ...response,
+    _meta: {
+      ...currentMeta,
+      lody: {
+        ...currentLody,
+        forkPoint,
+      },
+    },
+  };
+}
+
 export function findClaudeForkPointBeforePrompt(
   messages: ReadonlyArray<unknown>,
   promptUuid: string,
@@ -343,6 +363,9 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
+  /** Provider-native rewind boundary for the latest top-level assistant
+   *  message attributed to this turn. Returned to Lody in PromptResponse meta. */
+  forkPoint?: string;
   /** Client-generated correlation id echoed only when the SDK actually
    *  applies this steer to the main-agent command queue. */
   clientSteerId?: string;
@@ -2357,7 +2380,7 @@ export class ClaudeAcpAgent {
         // carries its own copy.
         session.emittedAssistantText = false;
       }
-      turn.resolve(result);
+      turn.resolve(withLodyForkPoint(result, turn.forkPoint));
     };
 
     /** Reject the active turn (auth required, error result, …) without tearing
@@ -2397,7 +2420,7 @@ export class ClaudeAcpAgent {
             // recorded — a stream death during the post-answer hold is a
             // background failure, not the turn's. Resolve with the real
             // outcome, mirroring the stream-done path.
-            turn.resolve(turn.deferredSettle);
+            turn.resolve(withLodyForkPoint(turn.deferredSettle, turn.forkPoint));
           } else {
             turn.reject(error);
           }
@@ -3766,6 +3789,12 @@ export class ClaudeAcpAgent {
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
+              if (typeof message.uuid === "string" && message.uuid.length > 0) {
+                const owningTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                if (owningTurn) {
+                  owningTurn.forkPoint = message.uuid;
+                }
+              }
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               if (message.message.model && message.message.model !== "<synthetic>") {
@@ -4202,7 +4231,12 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
+        active.resolve(
+          withLodyForkPoint(
+            { stopReason: "cancelled", usage: active.deferredSettle.usage },
+            active.forkPoint,
+          ),
+        );
       }
     }
 
