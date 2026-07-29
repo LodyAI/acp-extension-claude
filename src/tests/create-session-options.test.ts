@@ -15,6 +15,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
   return {
     ...actual,
+    getSessionMessages: vi.fn(async () => [
+      {
+        type: "assistant",
+        uuid: "22222222-2222-4222-8222-222222222222",
+        parent_tool_use_id: null,
+        message: { id: "msg_fork_boundary" },
+      },
+    ]),
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
@@ -112,14 +120,17 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
-  it("forks through the provider boundary supplied by Lody", async () => {
+  it("maps the ACP message boundary supplied by Lody to the provider uuid", async () => {
     await agent.unstable_forkSession({
       sessionId: "11111111-1111-4111-8111-111111111111",
       cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         lody: {
-          forkPoint: "22222222-2222-4222-8222-222222222222",
+          forkAtMessage: {
+            version: 1,
+            messageId: "msg_fork_boundary",
+          },
         },
       },
     });

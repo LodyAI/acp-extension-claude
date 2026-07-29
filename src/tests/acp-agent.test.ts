@@ -6813,9 +6813,7 @@ describe("result origin handling", () => {
     });
 
     expect(response.stopReason).toBe("max_tokens");
-    expect(response._meta).toMatchObject({
-      lody: { forkPoint: assistant.uuid },
-    });
+    expect(response._meta?.lody).toBeUndefined();
   });
 });
 

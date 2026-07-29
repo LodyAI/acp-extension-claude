@@ -210,57 +210,44 @@ const TURN_NO_RESULT_MESSAGE =
  *  agreed ACP steering wire protocol; advertised to clients via the top-level
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
-export const LODY_FORK_POINT_BEFORE_ACTIVE_TURN_METHOD =
-  "_lody/session/fork-point-before-active-turn";
+export const LODY_FORK_MESSAGE_BEFORE_ACTIVE_TURN_METHOD =
+  "_lody/session/fork-message-before-active-turn";
 
-type ForkPointBeforeActiveTurnRequest = {
+type ForkMessageBeforeActiveTurnRequest = {
   sessionId: string;
 };
 
-type ForkPointBeforeActiveTurnResponse = {
-  forkPoint: string;
+type ForkMessageBeforeActiveTurnResponse = {
+  messageId: string;
 };
 
-function parseForkPointBeforeActiveTurnRequest(params: unknown): ForkPointBeforeActiveTurnRequest {
+function parseForkMessageBeforeActiveTurnRequest(
+  params: unknown,
+): ForkMessageBeforeActiveTurnRequest {
   if (!params || typeof params !== "object") {
-    throw RequestError.invalidParams(undefined, "fork point params must be an object");
+    throw RequestError.invalidParams(undefined, "fork message params must be an object");
   }
   const { sessionId } = params as Record<string, unknown>;
   if (typeof sessionId !== "string" || sessionId.length === 0) {
-    throw RequestError.invalidParams(undefined, "fork point params require a sessionId");
+    throw RequestError.invalidParams(undefined, "fork message params require a sessionId");
   }
   return { sessionId };
 }
 
-function getLodyForkPoint(meta: unknown): string | undefined {
+function getLodyForkMessageId(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") return undefined;
   const lody = (meta as Record<string, unknown>).lody;
   if (!lody || typeof lody !== "object") return undefined;
-  const forkPoint = (lody as Record<string, unknown>).forkPoint;
-  return typeof forkPoint === "string" && forkPoint.length > 0 ? forkPoint : undefined;
+  const forkAtMessage = (lody as Record<string, unknown>).forkAtMessage;
+  if (!forkAtMessage || typeof forkAtMessage !== "object") return undefined;
+  const version = (forkAtMessage as Record<string, unknown>).version;
+  const messageId = (forkAtMessage as Record<string, unknown>).messageId;
+  return version === 1 && typeof messageId === "string" && messageId.length > 0
+    ? messageId
+    : undefined;
 }
 
-function withLodyForkPoint(
-  response: PromptResponse,
-  forkPoint: string | undefined,
-): PromptResponse {
-  if (!forkPoint) return response;
-  const currentMeta = response._meta && typeof response._meta === "object" ? response._meta : {};
-  const currentLody =
-    currentMeta.lody && typeof currentMeta.lody === "object" ? currentMeta.lody : {};
-  return {
-    ...response,
-    _meta: {
-      ...currentMeta,
-      lody: {
-        ...currentLody,
-        forkPoint,
-      },
-    },
-  };
-}
-
-export function findClaudeForkPointBeforePrompt(
+export function findClaudeMessageBeforePrompt(
   messages: ReadonlyArray<unknown>,
   promptUuid: string,
 ): string | null {
@@ -276,15 +263,41 @@ export function findClaudeForkPointBeforePrompt(
     const message = messages[index];
     if (!message || typeof message !== "object") continue;
     const candidate = message as {
-      type?: unknown;
-      uuid?: unknown;
+      type?: string;
+      uuid?: string | null;
       parent_tool_use_id?: unknown;
+      message?: unknown;
+    };
+    if (
+      candidate.type === "assistant" &&
+      candidate.parent_tool_use_id == null &&
+      typeof candidate.uuid === "string"
+    ) {
+      return messageIdForGrouping(candidate) ?? null;
+    }
+  }
+  return null;
+}
+
+export function findClaudeAssistantUuidForMessage(
+  messages: ReadonlyArray<unknown>,
+  messageId: string,
+): string | null {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (!message || typeof message !== "object") continue;
+    const candidate = message as {
+      type?: string;
+      uuid?: string | null;
+      parent_tool_use_id?: unknown;
+      message?: unknown;
     };
     if (
       candidate.type === "assistant" &&
       candidate.parent_tool_use_id == null &&
       typeof candidate.uuid === "string" &&
-      candidate.uuid.length > 0
+      candidate.uuid.length > 0 &&
+      messageIdForGrouping(candidate) === messageId
     ) {
       return candidate.uuid;
     }
@@ -363,9 +376,6 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
-  /** Provider-native rewind boundary for the latest top-level assistant
-   *  message attributed to this turn. Returned to Lody in PromptResponse meta. */
-  forkPoint?: string;
   /** Client-generated correlation id echoed only when the SDK actually
    *  applies this steer to the main-agent command queue. */
   clientSteerId?: string;
@@ -751,8 +761,8 @@ type Session = {
    *  naturally yields the turn-boundary uuid when one `msg_…` spans several
    *  content-block messages.
    *
-   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
-   *  fork/rewind. */
+   *  Fork requests validate against the persisted transcript before using the
+   *  provider-native uuid; this map remains shared infrastructure for rewind. */
   messageIdToUuid: Map<string, string>;
 };
 
@@ -1531,7 +1541,7 @@ export class ClaudeAcpAgent {
             },
           },
           lody: {
-            forkPointBeforeActiveTurn: { version: 1 },
+            forkAtMessage: { version: 1, beforeActiveTurn: true },
           },
         },
         promptCapabilities: {
@@ -1594,7 +1604,16 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
-    const forkPoint = getLodyForkPoint(params._meta);
+    const forkMessageId = getLodyForkMessageId(params._meta);
+    const forkMessageUuid = forkMessageId
+      ? (findClaudeAssistantUuidForMessage(
+          await getSessionMessages(params.sessionId),
+          forkMessageId,
+        ) ?? undefined)
+      : undefined;
+    if (forkMessageId && !forkMessageUuid) {
+      throw RequestError.invalidRequest("ACP message is not a forkable Claude assistant boundary");
+    }
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1605,7 +1624,7 @@ export class ClaudeAcpAgent {
       {
         resume: params.sessionId,
         forkSession: true,
-        resumeSessionAt: forkPoint,
+        resumeSessionAt: forkMessageUuid,
       },
     );
     // Needs to happen after we return the session
@@ -1615,9 +1634,9 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  async resolveForkPointBeforeActiveTurn(
-    params: ForkPointBeforeActiveTurnRequest,
-  ): Promise<ForkPointBeforeActiveTurnResponse> {
+  async resolveMessageBeforeActiveTurn(
+    params: ForkMessageBeforeActiveTurnRequest,
+  ): Promise<ForkMessageBeforeActiveTurnResponse> {
     const session = this.sessions[params.sessionId];
     const activeTurn =
       session?.activeTurn ?? session?.turnQueue?.find((turn) => !turn.settled) ?? null;
@@ -1625,11 +1644,11 @@ export class ClaudeAcpAgent {
       throw RequestError.invalidRequest("Session has no active turn");
     }
     const messages = await getSessionMessages(params.sessionId);
-    const forkPoint = findClaudeForkPointBeforePrompt(messages, activeTurn.promptUuid);
-    if (!forkPoint) {
+    const messageId = findClaudeMessageBeforePrompt(messages, activeTurn.promptUuid);
+    if (!messageId) {
       throw RequestError.invalidRequest("No assistant turn exists before the active turn");
     }
-    return { forkPoint };
+    return { messageId };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -2380,7 +2399,7 @@ export class ClaudeAcpAgent {
         // carries its own copy.
         session.emittedAssistantText = false;
       }
-      turn.resolve(withLodyForkPoint(result, turn.forkPoint));
+      turn.resolve(result);
     };
 
     /** Reject the active turn (auth required, error result, …) without tearing
@@ -2420,7 +2439,7 @@ export class ClaudeAcpAgent {
             // recorded — a stream death during the post-answer hold is a
             // background failure, not the turn's. Resolve with the real
             // outcome, mirroring the stream-done path.
-            turn.resolve(withLodyForkPoint(turn.deferredSettle, turn.forkPoint));
+            turn.resolve(turn.deferredSettle);
           } else {
             turn.reject(error);
           }
@@ -3789,12 +3808,6 @@ export class ClaudeAcpAgent {
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              if (typeof message.uuid === "string" && message.uuid.length > 0) {
-                const owningTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
-                if (owningTurn) {
-                  owningTurn.forkPoint = message.uuid;
-                }
-              }
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               if (message.message.model && message.message.model !== "<synthetic>") {
@@ -4231,12 +4244,7 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve(
-          withLodyForkPoint(
-            { stopReason: "cancelled", usage: active.deferredSettle.usage },
-            active.forkPoint,
-          ),
-        );
+        active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
       }
     }
 
@@ -7726,10 +7734,10 @@ export function runAcp() {
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
     )
-    .onRequest<ForkPointBeforeActiveTurnRequest, ForkPointBeforeActiveTurnResponse>(
-      LODY_FORK_POINT_BEFORE_ACTIVE_TURN_METHOD,
-      { parse: parseForkPointBeforeActiveTurnRequest },
-      (ctx) => agent.resolveForkPointBeforeActiveTurn(ctx.params),
+    .onRequest<ForkMessageBeforeActiveTurnRequest, ForkMessageBeforeActiveTurnResponse>(
+      LODY_FORK_MESSAGE_BEFORE_ACTIVE_TURN_METHOD,
+      { parse: parseForkMessageBeforeActiveTurnRequest },
+      (ctx) => agent.resolveMessageBeforeActiveTurn(ctx.params),
     )
     .connect(stream);
 

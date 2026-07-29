@@ -1,15 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { findClaudeForkPointBeforePrompt } from "../acp-agent.js";
+import { findClaudeAssistantUuidForMessage, findClaudeMessageBeforePrompt } from "../acp-agent.js";
 
-describe("findClaudeForkPointBeforePrompt", () => {
-  it("selects the completed assistant message before the active user prompt", () => {
+describe("Claude ACP fork message mapping", () => {
+  it("selects the ACP assistant message before the active user prompt", () => {
     expect(
-      findClaudeForkPointBeforePrompt(
+      findClaudeMessageBeforePrompt(
         [
           {
             type: "assistant",
             uuid: "completed-assistant",
             parent_tool_use_id: null,
+            message: { id: "msg_completed" },
           },
           {
             type: "user",
@@ -23,17 +24,18 @@ describe("findClaudeForkPointBeforePrompt", () => {
         ],
         "active-prompt",
       ),
-    ).toBe("completed-assistant");
+    ).toBe("msg_completed");
   });
 
   it("ignores subagent assistant messages", () => {
     expect(
-      findClaudeForkPointBeforePrompt(
+      findClaudeMessageBeforePrompt(
         [
           {
             type: "assistant",
             uuid: "completed-assistant",
             parent_tool_use_id: null,
+            message: { id: "msg_completed" },
           },
           {
             type: "assistant",
@@ -47,12 +49,12 @@ describe("findClaudeForkPointBeforePrompt", () => {
         ],
         "active-prompt",
       ),
-    ).toBe("completed-assistant");
+    ).toBe("msg_completed");
   });
 
   it("rejects a stale active prompt marker", () => {
     expect(
-      findClaudeForkPointBeforePrompt(
+      findClaudeMessageBeforePrompt(
         [
           {
             type: "assistant",
@@ -63,5 +65,27 @@ describe("findClaudeForkPointBeforePrompt", () => {
         "stale-active-prompt",
       ),
     ).toBeNull();
+  });
+
+  it("maps an ACP message id back to the top-level Claude assistant uuid", () => {
+    expect(
+      findClaudeAssistantUuidForMessage(
+        [
+          {
+            type: "assistant",
+            uuid: "subagent-assistant",
+            parent_tool_use_id: "tool-1",
+            message: { id: "msg_target" },
+          },
+          {
+            type: "assistant",
+            uuid: "completed-assistant",
+            parent_tool_use_id: null,
+            message: { id: "msg_target" },
+          },
+        ],
+        "msg_target",
+      ),
+    ).toBe("completed-assistant");
   });
 });
