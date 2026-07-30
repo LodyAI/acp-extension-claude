@@ -210,99 +210,16 @@ const TURN_NO_RESULT_MESSAGE =
  *  agreed ACP steering wire protocol; advertised to clients via the top-level
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
-export const LODY_FORK_MESSAGE_BEFORE_ACTIVE_TURN_METHOD =
-  "_lody/session/fork-message-before-active-turn";
 
-type ForkMessageBeforeActiveTurnRequest = {
-  sessionId: string;
-};
-
-type ForkMessageBeforeActiveTurnResponse = {
-  messageId: string;
-};
-
-function parseForkMessageBeforeActiveTurnRequest(
-  params: unknown,
-): ForkMessageBeforeActiveTurnRequest {
-  if (!params || typeof params !== "object") {
-    throw RequestError.invalidParams(undefined, "fork message params must be an object");
-  }
-  const { sessionId } = params as Record<string, unknown>;
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
-    throw RequestError.invalidParams(undefined, "fork message params require a sessionId");
-  }
-  return { sessionId };
-}
-
-function getLodyForkMessageId(meta: unknown): string | undefined {
+function getLodyForkTurnId(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") return undefined;
   const lody = (meta as Record<string, unknown>).lody;
   if (!lody || typeof lody !== "object") return undefined;
-  const forkAtMessage = (lody as Record<string, unknown>).forkAtMessage;
-  if (!forkAtMessage || typeof forkAtMessage !== "object") return undefined;
-  const version = (forkAtMessage as Record<string, unknown>).version;
-  const messageId = (forkAtMessage as Record<string, unknown>).messageId;
-  return version === 1 && typeof messageId === "string" && messageId.length > 0
-    ? messageId
-    : undefined;
-}
-
-export function findClaudeMessageBeforePrompt(
-  messages: ReadonlyArray<unknown>,
-  promptUuid: string,
-): string | null {
-  const promptIndex = messages.findIndex(
-    (message) =>
-      !!message &&
-      typeof message === "object" &&
-      (message as { type?: unknown }).type === "user" &&
-      (message as { uuid?: unknown }).uuid === promptUuid,
-  );
-  if (promptIndex < 0) return null;
-  for (let index = promptIndex - 1; index >= 0; index--) {
-    const message = messages[index];
-    if (!message || typeof message !== "object") continue;
-    const candidate = message as {
-      type?: string;
-      uuid?: string | null;
-      parent_tool_use_id?: unknown;
-      message?: unknown;
-    };
-    if (
-      candidate.type === "assistant" &&
-      candidate.parent_tool_use_id == null &&
-      typeof candidate.uuid === "string"
-    ) {
-      return messageIdForGrouping(candidate) ?? null;
-    }
-  }
-  return null;
-}
-
-export function findClaudeAssistantUuidForMessage(
-  messages: ReadonlyArray<unknown>,
-  messageId: string,
-): string | null {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index];
-    if (!message || typeof message !== "object") continue;
-    const candidate = message as {
-      type?: string;
-      uuid?: string | null;
-      parent_tool_use_id?: unknown;
-      message?: unknown;
-    };
-    if (
-      candidate.type === "assistant" &&
-      candidate.parent_tool_use_id == null &&
-      typeof candidate.uuid === "string" &&
-      candidate.uuid.length > 0 &&
-      messageIdForGrouping(candidate) === messageId
-    ) {
-      return candidate.uuid;
-    }
-  }
-  return null;
+  const forkAtTurn = (lody as Record<string, unknown>).forkAtTurn;
+  if (!forkAtTurn || typeof forkAtTurn !== "object") return undefined;
+  const version = (forkAtTurn as Record<string, unknown>).version;
+  const turnId = (forkAtTurn as Record<string, unknown>).turnId;
+  return version === 1 && typeof turnId === "string" && turnId.length > 0 ? turnId : undefined;
 }
 
 /** How urgently the SDK delivers a steered message relative to the running
@@ -746,24 +663,6 @@ type Session = {
    *  just absorbs one future idle, and detection degrades to the status quo
    *  rather than misfiring. */
   owedTrailingIdles: number;
-  /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
-   *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
-   *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
-   *  `SDKAssistantMessage.uuid`). For assistant turns the two differ — the ACP
-   *  id is the Anthropic API message id (`msg_…`), available at `message_start`
-   *  so streamed chunks can carry it, while the uuid only arrives on the
-   *  consolidated message — so a client can only ask to rewind/fork by the id it
-   *  was given, and we need this table to translate it back.
-   *
-   *  Populated as a byproduct of the message loop (the consolidated message
-   *  carries both ids) and of `replaySessionHistory` on load, so no extra
-   *  `getSessionMessages` read is needed at rewind time. Last-write-wins
-   *  naturally yields the turn-boundary uuid when one `msg_…` spans several
-   *  content-block messages.
-   *
-   *  Fork requests validate against the persisted transcript before using the
-   *  provider-native uuid; this map remains shared infrastructure for rewind. */
-  messageIdToUuid: Map<string, string>;
 };
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
@@ -1541,7 +1440,7 @@ export class ClaudeAcpAgent {
             },
           },
           lody: {
-            forkAtMessage: { version: 1, beforeActiveTurn: true },
+            forkAtTurn: { version: 1 },
           },
         },
         promptCapabilities: {
@@ -1604,16 +1503,7 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
-    const forkMessageId = getLodyForkMessageId(params._meta);
-    const forkMessageUuid = forkMessageId
-      ? (findClaudeAssistantUuidForMessage(
-          await getSessionMessages(params.sessionId),
-          forkMessageId,
-        ) ?? undefined)
-      : undefined;
-    if (forkMessageId && !forkMessageUuid) {
-      throw RequestError.invalidRequest("ACP message is not a forkable Claude assistant boundary");
-    }
+    const forkTurnId = getLodyForkTurnId(params._meta);
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1624,7 +1514,7 @@ export class ClaudeAcpAgent {
       {
         resume: params.sessionId,
         forkSession: true,
-        resumeSessionAt: forkMessageUuid,
+        resumeSessionAt: forkTurnId,
       },
     );
     // Needs to happen after we return the session
@@ -1632,23 +1522,6 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
-  }
-
-  async resolveMessageBeforeActiveTurn(
-    params: ForkMessageBeforeActiveTurnRequest,
-  ): Promise<ForkMessageBeforeActiveTurnResponse> {
-    const session = this.sessions[params.sessionId];
-    const activeTurn =
-      session?.activeTurn ?? session?.turnQueue?.find((turn) => !turn.settled) ?? null;
-    if (!activeTurn) {
-      throw RequestError.invalidRequest("Session has no active turn");
-    }
-    const messages = await getSessionMessages(params.sessionId);
-    const messageId = findClaudeMessageBeforePrompt(messages, activeTurn.promptUuid);
-    if (!messageId) {
-      throw RequestError.invalidRequest("No assistant turn exists before the active turn");
-    }
-    return { messageId };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -3725,15 +3598,6 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
-            // Record the ACP messageId -> SDK uuid mapping for this message
-            // (including replays). The consolidated message carries both ids, so
-            // this is where we learn the uuid the SDK's rewind/resume APIs key on
-            // for the id we hand clients. Not read yet (see messageIdToUuid).
-            const mappedMessageId = messageIdForGrouping(message);
-            if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
-              session.messageIdToUuid.set(mappedMessageId, message.uuid);
-            }
-
             // A replayed user message echoes a queued turn back in submission
             // order. The first echo promotes that turn to active; if a different
             // turn is still active, it is handed off (settled end_turn) first.
@@ -3990,6 +3854,14 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(notification);
+            }
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              typeof message.uuid === "string" &&
+              message.uuid.length > 0
+            ) {
+              await sendUpdate(createClaudeTurnBoundaryUpdate(params.sessionId, message.uuid));
             }
             break;
           }
@@ -4559,15 +4431,7 @@ export class ClaudeAcpAgent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
-      // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
-      // observe live (resumed/loaded sessions), so rewind/resume can translate
-      // a client-supplied id without an extra getSessionMessages read. Not read
-      // yet (see Session.messageIdToUuid).
       const replayMessageId = messageIdForGrouping(message);
-      const replaySession = this.sessions[sessionId];
-      if (replaySession && replayMessageId && message.uuid) {
-        replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
-      }
 
       // The live prompt loop converts the synthetic "Please run /login"
       // assistant message into an authRequired error instead of showing its
@@ -4602,6 +4466,14 @@ export class ClaudeAcpAgent {
         },
       )) {
         await this.client.sessionUpdate(notification);
+      }
+      if (
+        message.type === "assistant" &&
+        message.parent_tool_use_id === null &&
+        typeof message.uuid === "string" &&
+        message.uuid.length > 0
+      ) {
+        await this.client.sessionUpdate(createClaudeTurnBoundaryUpdate(sessionId, message.uuid));
       }
     }
   }
@@ -5917,7 +5789,6 @@ export class ClaudeAcpAgent {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
 
     return {
@@ -6986,6 +6857,16 @@ function applyMessageId(
   }
 }
 
+function createClaudeTurnBoundaryUpdate(sessionId: string, turnId: string): SessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "session_info_update",
+      _meta: { lody: { turnId } },
+    },
+  };
+}
+
 /** Built-in tools that drive the task list (headless/SDK sessions use these
  *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
  *  snapshots rather than as tool_calls. */
@@ -7733,11 +7614,6 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
-    )
-    .onRequest<ForkMessageBeforeActiveTurnRequest, ForkMessageBeforeActiveTurnResponse>(
-      LODY_FORK_MESSAGE_BEFORE_ACTIVE_TURN_METHOD,
-      { parse: parseForkMessageBeforeActiveTurnRequest },
-      (ctx) => agent.resolveMessageBeforeActiveTurn(ctx.params),
     )
     .connect(stream);
 

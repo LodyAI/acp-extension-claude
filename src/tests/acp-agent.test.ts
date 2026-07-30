@@ -170,7 +170,6 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     liveBackgroundTasks: new Map(),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
-    messageIdToUuid: new Map(),
     ...overrides,
   } as any;
 }
@@ -1962,7 +1961,6 @@ describe("permission request cancellation", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
   }
@@ -3979,7 +3977,6 @@ describe("session/close", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -4071,7 +4068,6 @@ describe("session/delete", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -4180,7 +4176,6 @@ describe("getOrCreateSession param change detection", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -7086,7 +7081,6 @@ describe("post-error recovery", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
     return { interrupt };
   }
@@ -10088,7 +10082,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
     };
     return { interrupt };
   }
@@ -11359,7 +11352,6 @@ describe("agent selection config option", () => {
         liveBackgroundTasks: new Map(),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
-        messageIdToUuid: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
     }
