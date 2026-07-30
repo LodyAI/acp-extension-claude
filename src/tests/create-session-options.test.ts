@@ -15,14 +15,6 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
   return {
     ...actual,
-    getSessionMessages: vi.fn(async () => [
-      {
-        type: "assistant",
-        uuid: "22222222-2222-4222-8222-222222222222",
-        parent_tool_use_id: null,
-        message: { id: "msg_fork_boundary" },
-      },
-    ]),
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
