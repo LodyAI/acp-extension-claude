@@ -15,6 +15,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
   return {
     ...actual,
+    getSessionMessages: vi.fn(async () => [
+      {
+        type: "assistant",
+        uuid: "22222222-2222-4222-8222-222222222222",
+        parent_tool_use_id: null,
+        message: { id: "msg_fork_boundary" },
+      },
+    ]),
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
@@ -110,6 +118,26 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
+  it("maps the ACP message boundary supplied by Lody to the provider uuid", async () => {
+    await agent.unstable_forkSession({
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        lody: {
+          forkAtMessage: {
+            version: 1,
+            messageId: "msg_fork_boundary",
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions?.resume).toBe("11111111-1111-4111-8111-111111111111");
+    expect(capturedOptions?.forkSession).toBe(true);
+    expect(capturedOptions?.resumeSessionAt).toBe("22222222-2222-4222-8222-222222222222");
   });
 
   it("sets tools to empty array when disableBuiltInTools is true", async () => {
