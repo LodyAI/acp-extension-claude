@@ -120,16 +120,16 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
-  it("maps the ACP message boundary supplied by Lody to the provider uuid", async () => {
+  it("uses the Claude turn id supplied by Lody directly", async () => {
     await agent.unstable_forkSession({
       sessionId: "11111111-1111-4111-8111-111111111111",
       cwd: process.cwd(),
       mcpServers: [],
       _meta: {
         lody: {
-          forkAtMessage: {
+          forkAtTurn: {
             version: 1,
-            messageId: "msg_fork_boundary",
+            turnId: "22222222-2222-4222-8222-222222222222",
           },
         },
       },
