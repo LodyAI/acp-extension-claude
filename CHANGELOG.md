@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.66.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.65.0...v0.66.0) (2026-08-07)
+
+
+### Features
+
+* **deps-dev:** Bump globals from 17.8.0 to 17.9.0 in the minor group ([#960](https://github.com/agentclientprotocol/claude-agent-acp/issues/960)) ([7f27c47](https://github.com/agentclientprotocol/claude-agent-acp/commit/7f27c47c5c7c49e65014e9f7dc55cba17352d33b))
+* expose provider-neutral ACP goal extension ([#964](https://github.com/agentclientprotocol/claude-agent-acp/issues/964)) ([8b31dea](https://github.com/agentclientprotocol/claude-agent-acp/commit/8b31dea11bed54f86c41217759159c415611346c))
+
+
+### Bug Fixes
+
+* publish and replace Claude goals reliably ([#967](https://github.com/agentclientprotocol/claude-agent-acp/issues/967)) ([f8fd3ab](https://github.com/agentclientprotocol/claude-agent-acp/commit/f8fd3ab8224420f8ced570e974cde09612939d6b))
+
+## [0.65.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.2...v0.65.0) (2026-08-05)
+
+
+### Features
+
+* **deps-dev:** Bump nanoid from 3.3.16 to 3.3.17 ([#951](https://github.com/agentclientprotocol/claude-agent-acp/issues/951)) ([b965dd2](https://github.com/agentclientprotocol/claude-agent-acp/commit/b965dd21917e822b56f5012c3572902f26c065c9))
+* **deps-dev:** Bump tinyexec from 1.2.4 to 1.3.0 in the minor group ([#959](https://github.com/agentclientprotocol/claude-agent-acp/issues/959)) ([15b4eb4](https://github.com/agentclientprotocol/claude-agent-acp/commit/15b4eb46f329566837eae58f2ee4b05e3e81bf64))
+* **deps:** Bump @hono/node-server from 1.19.17 to 2.1.0 ([#956](https://github.com/agentclientprotocol/claude-agent-acp/issues/956)) ([f9123f3](https://github.com/agentclientprotocol/claude-agent-acp/commit/f9123f3e18560b580398aabf49e2190f69746976))
+* **deps:** Bump fast-uri from 3.1.4 to 3.1.5 ([#952](https://github.com/agentclientprotocol/claude-agent-acp/issues/952)) ([0988438](https://github.com/agentclientprotocol/claude-agent-acp/commit/098843842895dcb450746bd064dbb1509e3049d1))
+* **steering:** settle a steered turn at idle, not at the interrupt ([#958](https://github.com/agentclientprotocol/claude-agent-acp/issues/958)) ([a84b810](https://github.com/agentclientprotocol/claude-agent-acp/commit/a84b81080a4127edf40bc448fc8bf2b15503304d))
+
+## [0.64.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.1...v0.64.2) (2026-08-02)
+
+
+### Bug Fixes
+
+* restore the single-tool representation for ExitPlanMode ([#942](https://github.com/agentclientprotocol/claude-agent-acp/issues/942)) ([4302a4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/4302a4b0b6df821b164cbe4857f26cf5b44b532c))
+
+## [0.64.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.0...v0.64.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* release 0.65.0 ([#939](https://github.com/agentclientprotocol/claude-agent-acp/issues/939)) ([0936ec2](https://github.com/agentclientprotocol/claude-agent-acp/commit/0936ec281ec730714c605e3da732069ff47d8969))
+
+## [0.64.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.63.0...v0.64.0) (2026-07-30)
+
+
+### Features
+
+* **deps:** Bump actions/checkout from 7.0.0 to 7.0.1 ([#925](https://github.com/agentclientprotocol/claude-agent-acp/issues/925)) ([8e099e8](https://github.com/agentclientprotocol/claude-agent-acp/commit/8e099e844254c3e91508c79a02e3e7dc2239fcbb))
+* **deps:** Bump the minor group with 7 updates ([#928](https://github.com/agentclientprotocol/claude-agent-acp/issues/928)) ([3f60921](https://github.com/agentclientprotocol/claude-agent-acp/commit/3f609219592e63b947539f79c696b3cedb421060))
+
+
+### Bug Fixes
+
+* **steering:** add opt-in host-owned fallback ([#919](https://github.com/agentclientprotocol/claude-agent-acp/issues/919)) ([43af4ec](https://github.com/agentclientprotocol/claude-agent-acp/commit/43af4ec29ea5396c2614813af05967bfb0b1bac8)), closes [#903](https://github.com/agentclientprotocol/claude-agent-acp/issues/903)
+
+## [0.63.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.62.0...v0.63.0) (2026-07-27)
+
+
+### Features
+
+* Update to claude agent sdk v0.3.220 ([#921](https://github.com/agentclientprotocol/claude-agent-acp/issues/921)) ([4c7b897](https://github.com/agentclientprotocol/claude-agent-acp/commit/4c7b89718306229254879e5045a183233b5ed073))
+
+
+### Bug Fixes
+
+* Only resolve a denied tool call the client was told about ([#923](https://github.com/agentclientprotocol/claude-agent-acp/issues/923)) ([8f67b6a](https://github.com/agentclientprotocol/claude-agent-acp/commit/8f67b6a92bec24ae43b3dfbd087fe35df0531857)), closes [#918](https://github.com/agentclientprotocol/claude-agent-acp/issues/918)
+* Report tool_progress heartbeats against the tool call they describe ([#916](https://github.com/agentclientprotocol/claude-agent-acp/issues/916)) ([5559ba8](https://github.com/agentclientprotocol/claude-agent-acp/commit/5559ba890ca614cdaa189500aba65d81cc4cd51a))
+* **tools:** key Bash terminal metas off the announced tool_use id ([#917](https://github.com/agentclientprotocol/claude-agent-acp/issues/917)) ([d060414](https://github.com/agentclientprotocol/claude-agent-acp/commit/d0604140f907adbf9747f26a070690926e1de82d))
+
 ## [0.62.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.61.0...v0.62.0) (2026-07-24)
 
 
