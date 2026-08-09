@@ -5081,7 +5081,7 @@ export class ClaudeAcpAgent {
         // the request goes out unattributed; log it so the regression is
         // observable rather than silent.
         this.logger.log(
-          `[claude-agent-acp] No parent tool_use recorded for subagent ${agentID}; ` +
+          `[acp-extension-claude] No parent tool_use recorded for subagent ${agentID}; ` +
             `sending the ${toolName} permission request unattributed`,
         );
       }
@@ -7846,7 +7846,7 @@ export function toAcpNotifications(
             });
           }
           logger.error(
-            `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
+            `[acp-extension-claude] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
           break;
         }
