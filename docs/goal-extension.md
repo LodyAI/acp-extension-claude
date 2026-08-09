@@ -1,6 +1,6 @@
 # Goal extension
 
-This document defines a provider-neutral experimental ACP extension implemented by `claude-agent-acp`. It is intentionally shaped like a possible future first-class ACP API: implementations publish `_meta.goal`, not provider-specific metadata such as `_meta.claudeCode.goal`.
+This document defines a provider-neutral experimental ACP extension implemented by `acp-extension-claude`. It is intentionally shaped like a possible future first-class ACP API: implementations publish `_meta.goal`, not provider-specific metadata such as `_meta.claudeCode.goal`.
 
 ## Capability negotiation
 

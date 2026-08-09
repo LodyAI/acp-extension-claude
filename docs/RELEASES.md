@@ -7,10 +7,11 @@ keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
 `autorelease: pending`.
 
 Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
-publishes to npm, and dispatches a version update to the agent registry.
+and publishes `acp-extension-claude` to npm.
 
-There is no manual release button, and versions are never typed in by hand: the
-version is an output of the commit history, not an input.
+There is no manual versioning or release-creation path: versions are never typed
+in by hand and remain an output of the commit history. The workflow's manual
+dispatch is only a recovery path for publishing an already-created tag to npm.
 
 ## Releasing
 
@@ -38,7 +39,7 @@ gates. Once the workflow finishes, confirm both outputs landed:
 
 ```sh
 gh release view "v<version>"
-npm view "@agentclientprotocol/claude-agent-acp@<version>"
+npm view "acp-extension-claude@<version>"
 ```
 
 ## How the version is chosen
@@ -66,7 +67,7 @@ the config entirely. The release type is declared inside the config instead.
 
 Because the config is what is read, it also has to say
 `"include-component-in-tag": false`. Left at its default, release-please derives a
-component from the package name and tags `claude-agent-acp-vX.Y.Z` instead of
+component from the package name and tags `acp-extension-claude-vX.Y.Z` instead of
 `vX.Y.Z`. That renames the tag every step here looks up, and because no tag under
 the new scheme exists, it also walks the entire commit history into the changelog
 rather than just what landed since the last release. The preflight checks the tag
@@ -95,25 +96,23 @@ gh pr edit <pr-number> --remove-label "autorelease: pending" \
 
 Then publish the tag as described below.
 
-### The tag exists but npm or the registry is missing
+### The tag exists but npm is missing
 
 npm publishes through OIDC from inside the workflow, so this cannot be done from
 a laptop. Re-run the publish workflow against the existing tag:
 
 ```sh
-gh workflow run publish.yml -f ref="v<version>" -f publish_npm=true
+gh workflow run publish.yml -f ref="v<version>"
 ```
 
-npm versions are immutable. If the package already published and only the
-registry update failed, pass `-f publish_npm=false` so the run skips publishing
-and only re-dispatches the registry update.
+npm versions are immutable, so only use the manual publish path when the package
+version is still absent from npm.
 
 ## Credentials
 
-| Secret                                                        | Used for                                                          |
-| ------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `RELEASE_PLZ_APP_ID`, `RELEASE_PLZ_APP_PRIVATE_KEY`           | App token for release PRs and tags, so they can trigger workflows |
-| `REGISTRY_UPDATER_APP_ID`, `REGISTRY_UPDATER_APP_PRIVATE_KEY` | App token scoped to the `registry` repository                     |
+| Secret                                              | Used for                                                          |
+| --------------------------------------------------- | ----------------------------------------------------------------- |
+| `RELEASE_PLZ_APP_ID`, `RELEASE_PLZ_APP_PRIVATE_KEY` | App token for release PRs and tags, so they can trigger workflows |
 
 Publishing to npm uses OIDC trusted publishing, so there is no npm token. All
 release jobs run in the `release` environment.

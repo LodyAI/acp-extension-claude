@@ -120,5 +120,5 @@ Ready to release $title_version.
 
   gh pr merge $pr_number --squash
 
-Merging tags v$title_version, publishes to npm and updates the agent registry.
+Merging tags v$title_version and publishes acp-extension-claude to npm.
 EOF
