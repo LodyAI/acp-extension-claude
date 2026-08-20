@@ -18,8 +18,8 @@ opening a PR.
 
 ## Pull Requests
 
-- Always open pull requests against the `loro-dev` organization repository
-  (`loro-dev/acp-extension-claude`), not a personal fork.
+- Always open pull requests against the `LodyAI` organization repository
+  (`LodyAI/acp-extension-claude`), not a personal fork.
 
 Squash merges use the PR title as the commit subject, and release-please parses it
 to compute the next version. Titles must be conventional commits using one of:
