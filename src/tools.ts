@@ -218,7 +218,7 @@ export function toolInfoFromToolUse(
       }
       const displayPath = input?.file_path ? toDisplayPath(input.file_path, cwd) : undefined;
       return {
-        title: displayPath ? `Write ${displayPath}` : "Write",
+        title: displayPath ? `Write ${displayPath}` : "Preparing file…",
         kind: "edit",
         content,
         locations: input?.file_path ? [{ path: input.file_path }] : [],
@@ -438,6 +438,16 @@ export function toolInfoFromToolUse(
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
           : [],
+      };
+    }
+
+    case "Skill": {
+      const input = toolUse.input as { skill?: string; args?: string } | undefined;
+      const skillName = input?.skill;
+      return {
+        title: skillName ? `Load skill: ${skillName}` : "Load skill",
+        kind: "other",
+        content: [],
       };
     }
 
@@ -861,6 +871,10 @@ export function toolUpdateFromToolResult(
         stripAgentTrailerFromContent(toolResult.content),
         "is_error" in toolResult ? toolResult.is_error : false,
       );
+    }
+
+    case "Skill": {
+      return {};
     }
 
     case "Edit": // Edit is handled in hooks
