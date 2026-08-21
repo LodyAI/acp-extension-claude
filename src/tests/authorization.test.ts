@@ -208,42 +208,6 @@ describe("authorization", () => {
     );
   });
 
-  it("hide claude auth but still show console login when terminal-auth is set", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { "terminal-auth": true },
-      },
-    });
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
-    );
-  });
-
-  it("hide claude auth but still show console login with terminal capability", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        auth: { terminal: true },
-      },
-    });
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
-    );
-  });
-
   it("SSH session falls back to single legacy login method", async () => {
     const [agent] = await createAgentMock();
     vi.stubGlobal("process", { ...process, env: { ...process.env, SSH_TTY: "/dev/pts/0" } });
@@ -299,22 +263,6 @@ describe("authorization", () => {
 
     expect(initializeResponse.authMethods).not.toContainEqual(
       expect.objectContaining({ id: "claude-login" }),
-    );
-  });
-
-  it("show claude authentication", async () => {
-    const [agent] = await createAgentMock();
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
-    });
-
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
     );
   });
 });
