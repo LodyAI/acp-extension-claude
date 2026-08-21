@@ -39,6 +39,7 @@ import {
   buildConfigOptions,
   createFastModeConfigOption,
   CLAUDE_STEER_APPLIED_METHOD,
+  CLAUDE_LODY_CAPABILITIES,
   discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
@@ -55,12 +56,7 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
-import {
-  GOAL_CONTROL_METHOD,
-  goalUpdateFromPrompt,
-  parseGoalRequest,
-  toGoalSnapshot,
-} from "../goal-extension.js";
+import { goalUpdateFromPrompt, parseGoalRequest, toGoalSnapshot } from "../goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -2860,7 +2856,10 @@ describe("subagent permission attribution (issue #851)", () => {
 
     const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
     expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    expect(requests[0].toolCall._meta).toMatchObject({
+      lody: { toolName: "Bash" },
+      claudeCode: { toolName: "Bash" },
+    });
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
     expect(log).toHaveBeenCalledWith(expect.stringContaining("agent-unknown"));
@@ -3496,20 +3495,21 @@ describe("stop reason propagation", () => {
       update: {
         sessionUpdate: "session_info_update",
         _meta: {
-          goal: {
-            objective: "Finish the migration",
-            status: "active",
-            iterations: 3,
-            lastReason: "Tests still need work",
-            createdAt: 1710000000123,
-            controlMethod: GOAL_CONTROL_METHOD,
+          lody: {
+            goal: {
+              objective: "Finish the migration",
+              status: "active",
+              iterations: 3,
+              lastReason: "Tests still need work",
+              createdAtEpochSeconds: 1710000000,
+            },
           },
         },
       },
     });
     expect(updates).toContainEqual({
       sessionId: "test-session",
-      update: { sessionUpdate: "session_info_update", _meta: { goal: null } },
+      update: { sessionUpdate: "session_info_update", _meta: { lody: { goal: null } } },
     });
     expect(updates.some((notification) => notification.update?._meta?.claudeCode?.goal)).toBe(
       false,
@@ -3547,10 +3547,11 @@ describe("stop reason propagation", () => {
         update: {
           sessionUpdate: "session_info_update",
           _meta: {
-            goal: {
-              objective: "Finish the migration",
-              status: "active",
-              controlMethod: GOAL_CONTROL_METHOD,
+            lody: {
+              goal: {
+                objective: "Finish the migration",
+                status: "active",
+              },
             },
           },
         },
@@ -3618,7 +3619,7 @@ describe("stop reason propagation", () => {
     ).rejects.toBeDefined();
 
     const goalUpdates = updates
-      .map(({ update }) => update._meta?.goal)
+      .map(({ update }) => update._meta?.lody?.goal)
       .filter((goal) => goal !== undefined);
     expect(goalUpdates.at(-2)).toEqual(
       expect.objectContaining({ objective: "Replacement", status: "active" }),
@@ -3653,8 +3654,7 @@ describe("stop reason propagation", () => {
       status: "active",
       iterations: 1,
       lastReason: null,
-      createdAt: 1710000000000,
-      controlMethod: GOAL_CONTROL_METHOD,
+      createdAtEpochSeconds: 1710000000,
     });
   });
 
@@ -4559,12 +4559,7 @@ describe("logout", () => {
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
-    const claudeCodeCapabilities = response.agentCapabilities?._meta?.claudeCode as
-      Record<string, unknown> | undefined;
-    expect(claudeCodeCapabilities?.steer).toEqual({
-      version: 1,
-      appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
-    });
+    expect(response.agentCapabilities?._meta?.lody).toEqual(CLAUDE_LODY_CAPABILITIES);
   });
 });
 
@@ -6884,7 +6879,19 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
 
-    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+    expect(messageChunkTexts(updates)).toEqual(["conversation summarized"]);
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          sessionUpdate: "tool_call",
+          _meta: {
+            lody: {
+              activity: { version: 1, kind: "context_compaction", automatic: false },
+            },
+          },
+        }),
+      }),
+    );
   });
 
   // Like injectSession, but serves two prompts: each turn's echo is yielded
@@ -7123,7 +7130,7 @@ describe("emitRawSDKMessages", () => {
   });
 
   it("emits task lifecycle notifications with full task payloads", async () => {
-    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    const { agent, updates, extNotifications } = createMockAgentWithExtNotification();
     const taskStarted = {
       type: "system" as const,
       subtype: "task_started" as const,
@@ -7183,20 +7190,27 @@ describe("emitRawSDKMessages", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
-    const taskLifecycle = extNotifications.filter((n) => n.method === "_claude/taskLifecycle");
+    const taskLifecycle = updates.filter(
+      (notification) => notification.update?._meta?.lody?.task?.taskId === "task-1",
+    );
     expect(taskLifecycle).toHaveLength(4);
-    expect(taskLifecycle.map((n) => n.params.message.subtype)).toEqual([
-      "task_started",
-      "task_progress",
-      "task_updated",
-      "task_notification",
+    expect(taskLifecycle.map((n) => n.update.sessionUpdate)).toEqual([
+      "tool_call",
+      "tool_call_update",
+      "tool_call_update",
+      "tool_call_update",
     ]);
-    expect(taskLifecycle[0].params).toEqual({
-      sessionId: "test-session",
-      acpSessionId: "sdk-session",
-      message: taskStarted,
+    expect(taskLifecycle[0].update._meta.lody.task).toMatchObject({
+      version: 1,
+      taskId: "task-1",
+      kind: "subagent",
+      status: "in_progress",
+      parentToolCallId: "tool-1",
     });
-    expect(taskLifecycle[3].params.message).toEqual(taskNotification);
+    expect(taskLifecycle[3].update._meta.lody.task).toMatchObject({
+      status: "completed",
+      summary: "Agent finished",
+    });
     expect(extNotifications.filter((n) => n.method === "_claude/sdkMessage")).toHaveLength(0);
   });
 
@@ -7920,7 +7934,7 @@ describe("post-error recovery", () => {
     const second = agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "second" }],
-      _meta: { claudeCode: { steer: { id: "steer-b" } } },
+      _meta: { lody: { steer: { id: "steer-b" } } },
     });
 
     await vi.waitFor(() => expect(events).toContain("applied:steer-b"));
@@ -10481,7 +10495,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   });
 });
 
-describe("turn steering (_session/steering)", () => {
+describe("turn steering (_meta.lody.steer)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
@@ -10514,8 +10528,8 @@ describe("turn steering (_session/steering)", () => {
     };
   }
 
-  // A minimal SDK assistant message carrying a single text block. Used by the
-  // promptRequired retry test to model the continuation turn's streamed reply.
+  // A minimal SDK assistant message carrying a single text block. Used to
+  // model the steered continuation's streamed reply.
   function createAssistantText(text: string) {
     return {
       type: "assistant" as const,
@@ -10573,7 +10587,11 @@ describe("turn steering (_session/steering)", () => {
   it("rejects when the session is unknown", async () => {
     const agent = createMockAgent();
     await expect(
-      agent.steer({ sessionId: "missing", prompt: [{ type: "text", text: "hi" }] }),
+      agent.steer({
+        sessionId: "missing",
+        prompt: [{ type: "text", text: "hi" }],
+        steerId: "steer-missing",
+      }),
     ).rejects.toThrow("Session not found");
   });
 
@@ -10593,26 +10611,21 @@ describe("turn steering (_session/steering)", () => {
       ],
     });
     await expect(
-      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] }),
+      agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "hi" }],
+        steerId: "steer-closed",
+      }),
     ).rejects.toThrow();
   });
 
-  it("preserves the existing steering capability declaration", async () => {
+  it("publishes the unified Lody capability declaration", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    // Top-level _meta (sibling of agentCapabilities), per the existing steering
-    // extension contract. Idle behavior is selected per steering request.
-    expect((response._meta as any)?.steering).toEqual({
-      supported: true,
-    });
-    expect((response._meta as any)?.goal).toEqual({
-      version: 1,
-      controlMethod: GOAL_CONTROL_METHOD,
-      actions: ["set", "clear"],
-    });
+    expect(response.agentCapabilities?._meta?.lody).toEqual(CLAUDE_LODY_CAPABILITIES);
   });
 
   it("submits set and clear through the session prompt queue when the session is idle", async () => {
@@ -10686,12 +10699,12 @@ describe("turn steering (_session/steering)", () => {
       sessionId: "test-session",
       update: {
         sessionUpdate: "session_info_update",
-        _meta: { goal: null },
+        _meta: { lody: { goal: null } },
       },
     });
     await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     const goalUpdates = updates
-      .map(({ update }) => update._meta?.goal)
+      .map(({ update }) => update._meta?.lody?.goal)
       .filter((goal) => goal !== undefined);
     const clearIndex = goalUpdates.findIndex((goal) => goal === null);
     expect(clearIndex).toBeGreaterThanOrEqual(0);
@@ -10741,10 +10754,11 @@ describe("turn steering (_session/steering)", () => {
       update: {
         sessionUpdate: "session_info_update",
         _meta: {
-          goal: {
-            objective: "Replacement",
-            status: "active",
-            controlMethod: GOAL_CONTROL_METHOD,
+          lody: {
+            goal: {
+              objective: "Replacement",
+              status: "active",
+            },
           },
         },
       },
@@ -10821,7 +10835,7 @@ describe("turn steering (_session/steering)", () => {
     await staleUpdate;
 
     const goalUpdates = updates
-      .map(({ update }) => update._meta?.goal)
+      .map(({ update }) => update._meta?.lody?.goal)
       .filter((goal) => goal !== undefined);
     const replacementIndex = goalUpdates.findIndex((goal) => goal?.objective === "Replacement");
     expect(replacementIndex).toBeGreaterThanOrEqual(0);
@@ -10840,7 +10854,9 @@ describe("turn steering (_session/steering)", () => {
         update: {
           sessionUpdate: "session_info_update",
           _meta: {
-            goal: expect.objectContaining({ objective: "Replacement", iterations: 1 }),
+            lody: {
+              goal: expect.objectContaining({ objective: "Replacement", iterations: 1 }),
+            },
           },
         },
       });
@@ -10882,7 +10898,7 @@ describe("turn steering (_session/steering)", () => {
     expect(
       updates.some(
         ({ update }) =>
-          update.sessionUpdate === "session_info_update" && update._meta?.goal === null,
+          update.sessionUpdate === "session_info_update" && update._meta?.lody?.goal === null,
       ),
     ).toBe(false);
   });
@@ -10913,7 +10929,7 @@ describe("turn steering (_session/steering)", () => {
     });
   });
 
-  it("preserves startedNewTurn by default when no turn is in flight", async () => {
+  it("returns failed without consuming the prompt when no turn is in flight", async () => {
     const agent = createMockAgent();
     const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
     agent.sessions["test-session"] = mockSessionState({
@@ -10924,93 +10940,11 @@ describe("turn steering (_session/steering)", () => {
     const request: SteerRequest = {
       sessionId: "test-session",
       prompt: [{ type: "text", text: "late follow-up" }],
+      steerId: "steer-idle",
     };
 
-    await expect(agent.steer(request)).resolves.toEqual({ outcome: "startedNewTurn" });
-    expect(prompt).toHaveBeenCalledWith(request);
-  });
-
-  it("returns promptRequired without consuming an opted-in prompt", async () => {
-    const agent = createMockAgent();
-    const input = new Pushable<any>();
-    const inputPush = vi.spyOn(input, "push");
-    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
-    // Idle session: turnQueue is empty, so the turn we meant to steer has (from
-    // the agent's view) already finished. The content must stay Host-owned.
-    agent.sessions["test-session"] = mockSessionState({
-      input,
-      turnQueue: [],
-    });
-
-    const response = await agent.steer({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "late follow-up" }],
-      _meta: { steering: { idleBehavior: "promptRequired" } },
-    });
-
-    expect(response).toEqual({
-      outcome: "promptRequired",
-      reason: "noRunningTurn",
-    });
-    // The idle branch must not start a detached turn, push SDK input, or mutate
-    // the queue — the Host retries the exact same content via session/prompt.
+    await expect(agent.steer(request)).resolves.toEqual({ outcome: "failed" });
     expect(prompt).not.toHaveBeenCalled();
-    expect(inputPush).not.toHaveBeenCalled();
-    expect(agent.sessions["test-session"].turnQueue).toEqual([]);
-  });
-
-  it("lets the host retry promptRequired content through session/prompt exactly once", async () => {
-    const updates: string[] = [];
-    const client = {
-      sessionUpdate: async (notification: any) => {
-        if (notification.update?.sessionUpdate === "agent_message_chunk") {
-          updates.push(notification.update.content?.text);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    const captured: any[] = [];
-    injectGeneratorSession(
-      agent,
-      (input) => {
-        async function* messageGenerator() {
-          const iter = input[Symbol.asyncIterator]();
-          const continuation = await iter.next();
-          captured.push(continuation.value);
-          yield userEcho(continuation.value);
-          yield createAssistantText("continuation response");
-          yield createResultMessage();
-          yield { type: "system", subtype: "session_state_changed", state: "idle" };
-        }
-        return messageGenerator();
-      },
-      { turnQueue: [] },
-    );
-    const request: SteerRequest = {
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "late follow-up" }],
-      _meta: { steering: { idleBehavior: "promptRequired" } },
-    };
-
-    // Steering an idle session leaves the content unconsumed...
-    await expect(agent.steer(request)).resolves.toEqual({
-      outcome: "promptRequired",
-      reason: "noRunningTurn",
-    });
-    await Promise.resolve();
-    expect(captured).toHaveLength(0);
-
-    // ...so the Host can submit the same content through a normal session/prompt,
-    // which owns the continuation's updates and terminal response.
-    await expect(agent.prompt(request)).resolves.toEqual(
-      expect.objectContaining({ stopReason: "end_turn" }),
-    );
-    expect(captured).toHaveLength(1);
-    expect(captured[0].priority).toBeUndefined();
-    expect(JSON.stringify(captured[0].message.content)).toContain("late follow-up");
-    expect(updates).toContain("continuation response");
-    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
-    await agent.sessions["test-session"]?.consumer;
   });
 
   it("injects (outcome 'injected') a priority:'now' message into the running turn without spawning a new turn", async () => {
@@ -11041,6 +10975,7 @@ describe("turn steering (_session/steering)", () => {
     const steerRes = await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "also handle X" }],
+      steerId: "steer-live",
     });
 
     // Steering into a live turn reports the 'injected' outcome.
@@ -11085,6 +11020,7 @@ describe("turn steering (_session/steering)", () => {
     await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/goal Replace the objective" }],
+      steerId: "steer-goal",
     });
 
     expect(updates).toContainEqual({
@@ -11092,10 +11028,11 @@ describe("turn steering (_session/steering)", () => {
       update: {
         sessionUpdate: "session_info_update",
         _meta: {
-          goal: {
-            objective: "Replace the objective",
-            status: "active",
-            controlMethod: GOAL_CONTROL_METHOD,
+          lody: {
+            goal: {
+              objective: "Replace the objective",
+              status: "active",
+            },
           },
         },
       },
@@ -11189,7 +11126,11 @@ describe("turn steering (_session/steering)", () => {
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
 
     await expect(
-      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+      agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle X" }],
+        steerId: "steer-interrupt",
+      }),
     ).resolves.toEqual({ outcome: "injected" });
 
     const response = await turn;
@@ -11243,6 +11184,7 @@ describe("turn steering (_session/steering)", () => {
     await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/goal clear" }],
+      steerId: "steer-diagnostic",
     });
 
     await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
@@ -11289,6 +11231,7 @@ describe("turn steering (_session/steering)", () => {
     await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "also handle X" }],
+      steerId: "steer-idle-before-echo",
     });
 
     await turn;
@@ -11339,6 +11282,7 @@ describe("turn steering (_session/steering)", () => {
     await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "also handle X" }],
+      steerId: "steer-handoff",
     });
 
     const second = agent
@@ -11403,6 +11347,7 @@ describe("turn steering (_session/steering)", () => {
     await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "also handle X" }],
+      steerId: "steer-cancel",
     });
     // The interrupted cycle's result has been recorded on the turn (not settled).
     await waitFor(() => agent.sessions["test-session"]?.activeTurn?.steeredSettle !== undefined);
@@ -11447,6 +11392,7 @@ describe("turn steering (_session/steering)", () => {
     const res = await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "queue this after" }],
+      steerId: "steer-priority",
       priority: "next",
     } as any);
     await turn;

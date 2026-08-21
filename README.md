@@ -20,17 +20,21 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-## Acknowledged steering
+## Lody extensions
 
-The adapter advertises a versioned `agentCapabilities._meta.claudeCode.steer`
-extension. A client that uses it must attach a unique
-`_meta.claudeCode.steer.id` to `session/prompt`. The adapter maps only these
-requests to Claude's `SDKUserMessage.priority = "now"`; ordinary prompts keep
-the SDK's default `next` behavior. When the Claude SDK echoes and applies the
-steer to the main-agent loop, the adapter sends
-`_claude/steerApplied { sessionId, steerId }` before forwarding output owned by
-the new prompt. Clients can hold the notification handler while they atomically
-switch their local turn/output ownership.
+The adapter advertises versioned capabilities under
+`agentCapabilities._meta.lody` using the contracts from `acp-extension-core`.
+These cover usage and rate-limit reporting, an independent rate-limit query,
+acknowledged steering, goals, subagent/background-task lifecycle, and compaction.
+ACP-standard elicitation, plans, session forking, and context-window usage remain
+on their standard protocol paths.
+
+For acknowledged steering, a client attaches a unique `_meta.lody.steer.id` to
+`session/prompt`. The adapter maps only those prompts to
+`SDKUserMessage.priority = "now"`; ordinary prompts keep the SDK's default
+`next` behavior. Once the SDK applies the steer, the adapter sends
+`_lody/session/steer_applied { sessionId, steerId }` before forwarding output
+owned by the new prompt.
 
 ### Nested subagent transcripts
 

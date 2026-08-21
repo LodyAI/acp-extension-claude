@@ -237,8 +237,11 @@ describe("askUserQuestionsToCreateRequest", () => {
       title: "Grid",
       description: "Cards in a responsive grid",
       _meta: {
-        "_claude/askUserQuestionOption": {
-          preview: "```\n[ ] [ ] [ ]\n[ ] [ ] [ ]\n```",
+        lody: {
+          elicitation: {
+            version: 1,
+            preview: "```\n[ ] [ ] [ ]\n[ ] [ ] [ ]\n```",
+          },
         },
       },
     });
@@ -265,9 +268,11 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        _askUserQuestionCustomAnswer: {
-          questionId: "question_0",
-          isCustomAnswer: true,
+        lody: {
+          elicitation: {
+            version: 1,
+            customAnswerFor: "question_0",
+          },
         },
       },
     });
@@ -275,9 +280,11 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        _askUserQuestionCustomAnswer: {
-          questionId: "question_1",
-          isCustomAnswer: true,
+        lody: {
+          elicitation: {
+            version: 1,
+            customAnswerFor: "question_1",
+          },
         },
       },
     });
