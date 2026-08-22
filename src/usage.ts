@@ -5,7 +5,7 @@ import * as path from "path";
 import * as os from "os";
 import * as https from "https";
 import { execFileSync } from "child_process";
-import { UsageData } from "acp-extension-core";
+import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
 
 interface CredentialsFile {
   claudeAiOauth?: {
@@ -53,12 +53,11 @@ const defaultDeps: UsageApiDeps = {
 /**
  * Get OAuth usage data from Anthropic API.
  * Returns null if user is an API user (no OAuth credentials) or credentials are expired.
- * Returns { apiUnavailable: true, ... } if API call fails (to show warning in HUD).
- *
- * Uses file-based cache since HUD runs as a new process each render (~300ms).
- * Cache TTL: 60s for success, 15s for failures.
+ * Returns null when the account has no subscription quota or the API is unavailable.
  */
-export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<UsageData | null> {
+export async function getUsage(
+  overrides: Partial<UsageApiDeps> = {},
+): Promise<RateLimitsSnapshot | null> {
   const deps = { ...defaultDeps, ...overrides };
   const now = deps.now();
   const homeDir = deps.homeDir();
@@ -81,16 +80,7 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
     // Fetch usage from API
     const apiResponse = await deps.fetchApi(accessToken);
     if (!apiResponse) {
-      // API call failed, cache the failure to prevent retry storms
-      const failureResult: UsageData = {
-        planName,
-        fiveHour: null,
-        sevenDay: null,
-        fiveHourResetAt: null,
-        sevenDayResetAt: null,
-        apiUnavailable: true,
-      };
-      return failureResult;
+      return null;
     }
 
     // Parse response - API returns 0-100 percentage directly
@@ -101,12 +91,32 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
     const fiveHourResetAt = parseDate(apiResponse.five_hour?.resets_at);
     const sevenDayResetAt = parseDate(apiResponse.seven_day?.resets_at);
 
-    const result: UsageData = {
-      planName,
-      fiveHour: fiveHour !== null ? fiveHour / 100 : null,
-      sevenDay: sevenDay !== null ? sevenDay / 100 : null,
-      fiveHourResetAt,
-      sevenDayResetAt,
+    const windows: RateLimitWindow[] = [];
+    if (fiveHour !== null) {
+      windows.push({
+        usedPercent: fiveHour,
+        windowDurationSeconds: 5 * 60 * 60,
+        resetsAtEpochSeconds: fiveHourResetAt,
+      });
+    }
+    if (sevenDay !== null) {
+      windows.push({
+        usedPercent: sevenDay,
+        windowDurationSeconds: 7 * 24 * 60 * 60,
+        resetsAtEpochSeconds: sevenDayResetAt,
+      });
+    }
+
+    const result: RateLimitsSnapshot = {
+      rateLimits: [
+        {
+          limitId: "claude",
+          scope: { providerId: "claude" },
+          planName,
+          windows,
+        },
+      ],
+      fetchedAtEpochSeconds: Math.floor(now / 1000),
     };
 
     return result;
@@ -304,7 +314,7 @@ function parseUtilization(value: number | undefined): number | null {
   return Math.round(Math.max(0, Math.min(100, value)));
 }
 
-/** Parse ISO date string safely, returning null for invalid dates */
+/** Parse an ISO date as Unix epoch seconds. */
 function parseDate(dateStr: string | undefined): number | null {
   if (!dateStr) return null;
   const date = new Date(dateStr);
@@ -312,7 +322,7 @@ function parseDate(dateStr: string | undefined): number | null {
   if (isNaN(date.getTime())) {
     return null;
   }
-  return date.getTime();
+  return Math.floor(date.getTime() / 1000);
 }
 
 function fetchUsageApi(accessToken: string): Promise<UsageApiResponse | null> {

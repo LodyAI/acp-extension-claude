@@ -87,8 +87,6 @@ import {
 import {
   GOAL_ACTIONS,
   GOAL_CONTROL_METHOD,
-  GOAL_EXTENSION_VERSION,
-  GoalCapability,
   GoalRequest,
   GoalControlResponse,
   GoalSnapshot,
@@ -170,9 +168,16 @@ import {
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
-  EXT_METHOD_NAME,
-  ModelUsage as ModelUsageExt,
-  SessionUsageUpdate,
+  LODY_EXTENSION_METHODS,
+  type LodyActivityMeta,
+  type LodyExtensionCapabilities,
+  type LodySteerRequest,
+  type LodySteerResponse,
+  type LodyTaskMeta,
+  type ModelUsage as ModelUsageExt,
+  type RateLimitsGetRequest,
+  type RateLimitsGetResponse,
+  type SessionUsageUpdate,
 } from "acp-extension-core";
 import { getUsage } from "./usage.js";
 
@@ -216,9 +221,112 @@ const ZERO_USAGE = Object.freeze({
   cache_creation_input_tokens: 0,
 });
 
+type ClaudeTaskLifecycleMessage = {
+  subtype: "task_started" | "task_progress" | "task_updated" | "task_notification";
+  session_id?: string;
+  task_id: string;
+  tool_use_id?: string;
+  description?: string;
+  subagent_type?: string;
+  task_type?: string;
+  workflow_name?: string;
+  prompt?: string;
+  skip_transcript?: boolean;
+  last_tool_name?: string;
+  summary?: string;
+  status?: string;
+  patch?: { status?: string; error?: string; is_backgrounded?: boolean };
+  usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number };
+};
+
+function claudeTaskStatus(message: ClaudeTaskLifecycleMessage): LodyTaskMeta["status"] {
+  if (message.subtype === "task_started" || message.subtype === "task_progress") {
+    return "in_progress";
+  }
+  const status = (message.patch?.status ?? message.status)?.toLowerCase();
+  if (["completed", "complete", "succeeded", "success"].includes(status ?? "")) {
+    return "completed";
+  }
+  if (["failed", "killed", "cancelled", "canceled", "stopped", "error"].includes(status ?? "")) {
+    return "failed";
+  }
+  return status === "pending" ? "pending" : "in_progress";
+}
+
+function cleanTaskText(value: string | undefined, maxLength = 2_000): string | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
+}
+
+function createClaudeTaskLifecycleUpdate(
+  message: ClaudeTaskLifecycleMessage,
+  isSubagent: boolean,
+): SessionNotification["update"] {
+  const actor =
+    cleanTaskText(
+      message.subagent_type ?? message.workflow_name ?? message.task_type ?? "Claude task",
+      160,
+    ) ?? "Claude task";
+  const description = cleanTaskText(message.description ?? message.prompt);
+  const summary = cleanTaskText(message.summary);
+  const error = cleanTaskText(message.patch?.error);
+  const lastToolName = cleanTaskText(message.last_tool_name, 160);
+  const usage = message.usage
+    ? {
+        ...(message.usage.total_tokens !== undefined
+          ? { totalTokens: message.usage.total_tokens }
+          : {}),
+        ...(message.usage.tool_uses !== undefined ? { toolUses: message.usage.tool_uses } : {}),
+        ...(message.usage.duration_ms !== undefined
+          ? { durationMs: message.usage.duration_ms }
+          : {}),
+      }
+    : undefined;
+  const task: LodyTaskMeta = {
+    version: 1,
+    taskId: message.task_id,
+    kind: isSubagent ? "subagent" : "background",
+    status: claudeTaskStatus(message),
+    actor,
+    ...(description ? { description } : {}),
+    ...(message.tool_use_id ? { parentToolCallId: message.tool_use_id } : {}),
+    ...(summary ? { summary } : {}),
+    ...(error ? { error } : {}),
+    ...(lastToolName ? { lastToolName } : {}),
+    ...(usage ? { usage } : {}),
+    ...(message.skip_transcript !== undefined ? { skipTranscript: message.skip_transcript } : {}),
+  };
+  const update = {
+    toolCallId: `task:${message.task_id}`,
+    title: description ? `${actor}: ${cleanTaskText(description, 160)}` : actor,
+    kind: "think" as const,
+    status: task.status,
+    _meta: { lody: { task } },
+  };
+  return message.subtype === "task_started"
+    ? { sessionUpdate: "tool_call", ...update }
+    : { sessionUpdate: "tool_call_update", ...update };
+}
+
 const DEFAULT_CONTEXT_WINDOW = 200000;
-const CLAUDE_TASK_LIFECYCLE_METHOD = "_claude/taskLifecycle";
-export const CLAUDE_STEER_APPLIED_METHOD = "_claude/steerApplied";
+export const CLAUDE_STEER_APPLIED_METHOD = LODY_EXTENSION_METHODS.sessionSteerApplied;
+
+export const CLAUDE_LODY_CAPABILITIES = {
+  usage: { version: 1 },
+  rateLimits: { version: 1, query: true },
+  forkAtTurn: { version: 1 },
+  steering: {
+    version: 1,
+    transport: "prompt",
+    upstreamTurn: "handoff",
+    configPolicy: "apply",
+  },
+  tasks: { version: 1, background: true },
+  subagents: { version: 1, lifecycle: true },
+  goal: { version: 1, actions: GOAL_ACTIONS },
+  compaction: { version: 1 },
+} as const satisfies LodyExtensionCapabilities;
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -239,13 +347,6 @@ const TURN_NO_RESULT_MESSAGE =
   "The turn ended without a result: the agent went idle while this prompt was still in flight " +
   "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
 
-/** Custom (extension) request method a client uses to steer the turn that is
- *  currently running: the message is injected into the in-flight turn rather
- *  than queued as a separate `session/prompt`. Named `_session/steering` per the
- *  agreed ACP steering wire protocol; advertised to clients via the top-level
- *  `InitializeResponse._meta.steering.supported`. */
-const STEER_METHOD = "_session/steering";
-
 function getLodyForkTurnId(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") return undefined;
   const lody = (meta as Record<string, unknown>).lody;
@@ -265,60 +366,23 @@ function getLodyForkTurnId(meta: unknown): string | undefined {
  *  steering always uses `now` so the running turn adapts as soon as possible. */
 const STEER_PRIORITY = "now" as const;
 
-/** Request-level steering options. `promptRequired` is opt-in so existing Hosts
- *  keep the established idle fallback behavior. */
-type SteerMeta = {
-  [key: string]: unknown;
-  steering?: {
-    idleBehavior?: "promptRequired";
-  };
-};
+export type SteerRequest = LodySteerRequest<PromptRequest["prompt"][number]>;
+export type SteerResponse = LodySteerResponse;
 
-/** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
- *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
- *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
-export type SteerRequest = {
-  sessionId: string;
-  prompt: PromptRequest["prompt"];
-  _meta?: SteerMeta | null;
-};
-
-/** Result of a {@link STEER_METHOD} request. The legacy `startedNewTurn` result
- *  remains the default idle behavior; `promptRequired` is returned only when the
- *  Host explicitly opts into the host-owned fallback in request `_meta`. */
-export type SteerResponse =
-  | { outcome: "injected" }
-  | { outcome: "startedNewTurn" }
-  | { outcome: "promptRequired"; reason: "noRunningTurn" };
-
-/** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
- *  content blocks are handed to `promptToClaude`, which tolerates unknown block
- *  types — but `sessionId` and a non-empty `prompt` array are required. */
-function parseSteerRequest(params: unknown): SteerRequest {
-  if (!params || typeof params !== "object") {
-    throw RequestError.invalidParams(undefined, "steer params must be an object");
+function parseRateLimitsGetRequest(params: unknown): RateLimitsGetRequest {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    throw RequestError.invalidParams(undefined, "rate limit params must be an object");
   }
-  const { sessionId, prompt, _meta } = params as Record<string, unknown>;
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
-    throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
-  }
-  if (!Array.isArray(prompt) || prompt.length === 0) {
-    throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
-  }
-  const steering =
-    _meta && typeof _meta === "object" ? (_meta as Record<string, unknown>).steering : undefined;
-  const idleBehavior =
-    steering && typeof steering === "object"
-      ? (steering as Record<string, unknown>).idleBehavior
-      : undefined;
-  if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
-    throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  const { sessionId, accountId, modelId } = params as Record<string, unknown>;
+  for (const [name, value] of Object.entries({ sessionId, accountId, modelId })) {
+    if (value !== undefined && typeof value !== "string") {
+      throw RequestError.invalidParams(undefined, `${name} must be a string`);
+    }
   }
   return {
-    sessionId,
-    prompt: prompt as PromptRequest["prompt"],
-    _meta: _meta as SteerMeta | null | undefined,
+    ...(typeof sessionId === "string" ? { sessionId } : {}),
+    ...(typeof accountId === "string" ? { accountId } : {}),
+    ...(typeof modelId === "string" ? { modelId } : {}),
   };
 }
 
@@ -452,11 +516,11 @@ type Turn = {
 };
 
 function getClientSteerId(meta: PromptRequest["_meta"]): string | undefined {
-  const claudeCode = meta?.claudeCode;
-  if (typeof claudeCode !== "object" || claudeCode === null) {
+  const lody = meta?.lody;
+  if (typeof lody !== "object" || lody === null) {
     return undefined;
   }
-  const steer = (claudeCode as Record<string, unknown>).steer;
+  const steer = (lody as Record<string, unknown>).steer;
   if (typeof steer !== "object" || steer === null) {
     return undefined;
   }
@@ -945,6 +1009,9 @@ type ProviderConfig = {
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  lody?: {
+    toolName: string;
+  };
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
@@ -1658,16 +1725,7 @@ export class ClaudeAcpAgent {
       protocolVersion: 1,
       agentCapabilities: {
         _meta: {
-          claudeCode: {
-            promptQueueing: true,
-            steer: {
-              version: 1,
-              appliedNotification: CLAUDE_STEER_APPLIED_METHOD,
-            },
-          },
-          lody: {
-            forkAtTurn: { version: 1 },
-          },
+          lody: CLAUDE_LODY_CAPABILITIES,
         },
         promptCapabilities: {
           image: true,
@@ -1703,21 +1761,19 @@ export class ClaudeAcpAgent {
         ...terminalAuthMethods,
         ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
       ],
-      // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
-      // steering extension contract: advertises the `_session/steering` request
-      // so clients know they may inject a follow-up into a running turn.
       _meta: {
         ...airSessionFailureCapabilityMeta(AGENT_FILE_CHANGE_REPORT_CAPABILITY),
-        steering: {
-          supported: true,
-        },
-        goal: {
-          version: GOAL_EXTENSION_VERSION,
-          controlMethod: GOAL_CONTROL_METHOD,
-          actions: [...GOAL_ACTIONS],
-        } satisfies GoalCapability,
       },
     };
+  }
+
+  async getRateLimits(_request: RateLimitsGetRequest): Promise<RateLimitsGetResponse> {
+    return (
+      (await getUsage()) ?? {
+        rateLimits: [],
+        fetchedAtEpochSeconds: Math.floor(Date.now() / 1000),
+      }
+    );
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponseWithAvailableCommands> {
@@ -2044,9 +2100,9 @@ export class ClaudeAcpAgent {
     const steering = await this.steer({
       sessionId: params.sessionId,
       prompt,
-      _meta: { steering: { idleBehavior: "promptRequired" } },
+      steerId: randomUUID(),
     });
-    if (steering.outcome === "promptRequired") {
+    if (steering.outcome === "failed") {
       await this.prompt({ sessionId: params.sessionId, prompt });
     }
     return {};
@@ -2061,7 +2117,7 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "session_info_update",
-        _meta: { goal },
+        _meta: { lody: { goal } },
       },
     });
   }
@@ -2112,12 +2168,7 @@ export class ClaudeAcpAgent {
     await this.publishGoal(sessionId, goal);
   }
 
-  /** Steer the session per the ACP steering wire protocol: inject a follow-up
-   *  message into the turn that is currently running. If that turn already
-   *  settled, the established default starts a new detached turn; Hosts may opt
-   *  into the host-owned `promptRequired` fallback through request `_meta`.
-   *
-   *  When a turn is in flight this injects (returns `injected`): unlike
+  /** Inject a follow-up into the currently running turn. Unlike
    *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
    *  an `SDKUserMessage` onto the same streaming input, which the SDK routes
    *  into the in-flight turn. The injected message's echo carries a uuid that
@@ -2130,13 +2181,7 @@ export class ClaudeAcpAgent {
    *
    *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
    *  own and the steered message runs as a second one, so the turn is marked
-   *  (`Turn.steeredEchoes`) to settle at the SDK's `idle` instead of that result.
-   *
-   *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
-   *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
-   *  stays Host-owned so the Host can submit it through a standard
-   *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
-   *  `startedNewTurn` result are preserved for compatibility. */
+   *  (`Turn.steeredEchoes`) to settle at the SDK's `idle` instead of that result. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
     const session = this.sessions[sessionId];
@@ -2154,29 +2199,16 @@ export class ClaudeAcpAgent {
     // turn cannot settle in the gap between deciding to inject and enqueueing.
     const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
     if (!turnInFlight) {
-      const promptRequest: PromptRequest = {
-        sessionId,
-        prompt: params.prompt,
-      };
-      if (params._meta?.steering?.idleBehavior === "promptRequired") {
-        // The opt-in path leaves the content untouched so the Host can retry via
-        // a normal session/prompt whose lifecycle owns the continuation result.
-        return { outcome: "promptRequired", reason: "noRunningTurn" };
-      }
-
-      // Preserve the established default for Hosts that do not opt in. This is
-      // intentionally detached for compatibility with the existing contract.
-      this.prompt(promptRequest).catch((error) => {
-        this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
-      });
-      return { outcome: "startedNewTurn" };
+      return { outcome: "failed" };
     }
 
     const promptRequest: PromptRequest = {
       sessionId,
-      prompt: params.prompt,
+      prompt: [...params.prompt],
     };
     const userMessage = promptToClaude(promptRequest);
+    // Claude's SDK requires a UUID for message identity. The protocol's
+    // steerId is an opaque correlation id, so keep the two domains separate.
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
@@ -2254,11 +2286,11 @@ export class ClaudeAcpAgent {
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
-    // Tracks whether we're inside a compaction. The SDK emits the terminal
+    // Tracks the standard ACP tool call used to represent compaction. The SDK emits the terminal
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
     // outcome only while a compaction is in progress, then clear this.
-    let compactionInProgress = false;
+    let compactionInProgress: { id: string } | null = null;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -2387,7 +2419,7 @@ export class ClaudeAcpAgent {
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
-      compactionInProgress = false;
+      compactionInProgress = null;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -2765,19 +2797,16 @@ export class ClaudeAcpAgent {
       }
     };
 
-    const emitTaskLifecycle = async (message: SDKMessage) => {
-      const extNotification = this.client.extNotification?.bind(this.client);
-      if (!extNotification) {
-        return;
-      }
+    const emitTaskLifecycle = async (message: ClaudeTaskLifecycleMessage) => {
       const acpSessionId =
         "session_id" in message && typeof message.session_id === "string"
           ? message.session_id
           : params.sessionId;
-      await extNotification(CLAUDE_TASK_LIFECYCLE_METHOD, {
-        sessionId: params.sessionId,
-        acpSessionId,
-        message: message as unknown as Record<string, unknown>,
+      const isSubagent =
+        !!message.subagent_type || session.liveBackgroundTasks.get(message.task_id)?.isSubagent;
+      await sendUpdate({
+        sessionId: acpSessionId,
+        update: createClaudeTaskLifecycleUpdate(message, isSubagent === true),
       });
     };
 
@@ -3083,39 +3112,69 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
                 if (message.status === "compacting") {
-                  compactionInProgress = true;
+                  const id = `context-compaction:${randomUUID()}`;
+                  compactionInProgress = { id };
+                  const activity: LodyActivityMeta = {
+                    version: 1,
+                    kind: "context_compaction",
+                    automatic: false,
+                    ...(lastAssistantTotalUsage === null
+                      ? {}
+                      : { usedTokensBefore: lastAssistantTotalUsage }),
+                  };
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
+                      sessionUpdate: "tool_call",
+                      toolCallId: id,
+                      title: "Compacting context",
+                      kind: "think",
+                      status: "in_progress",
+                      _meta: { lody: { activity } },
                     },
                   });
                 } else if (message.compact_result === "success" && compactionInProgress) {
-                  // The SDK signals manual `/compact` completion with a status
-                  // message carrying `compact_result`, not the `compact_boundary`
-                  // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: compactionInProgress.id,
+                      title: "Context compacted",
+                      status: "completed",
+                      _meta: {
+                        lody: {
+                          activity: {
+                            version: 1,
+                            kind: "context_compaction",
+                            automatic: false,
+                          } satisfies LodyActivityMeta,
+                        },
+                      },
                     },
                   });
                 } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                  const { id } = compactionInProgress;
+                  compactionInProgress = null;
                   await sendUpdate({
                     sessionId: message.session_id,
                     update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: id,
+                      title: "Context compaction failed",
+                      status: "failed",
+                      _meta: {
+                        lody: {
+                          activity: {
+                            version: 1,
+                            kind: "context_compaction",
+                            automatic: false,
+                            ...(message.compact_error
+                              ? { failureReason: message.compact_error }
+                              : {}),
+                          } satisfies LodyActivityMeta,
+                        },
+                      },
                     },
                   });
                 }
@@ -3146,6 +3205,29 @@ export class ClaudeAcpAgent {
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
+                const compaction = compactionInProgress;
+                const id = compaction?.id ?? `context-compaction:${randomUUID()}`;
+                await sendUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: compaction ? "tool_call_update" : "tool_call",
+                    toolCallId: id,
+                    title: "Context compacted",
+                    kind: "think",
+                    status: "completed",
+                    _meta: {
+                      lody: {
+                        activity: {
+                          version: 1,
+                          kind: "context_compaction",
+                          automatic: compaction === null,
+                          usedTokensAfter: lastAssistantTotalUsage,
+                        } satisfies LodyActivityMeta,
+                      },
+                    },
+                  },
+                });
+                compactionInProgress = null;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -3319,6 +3401,7 @@ export class ClaudeAcpAgent {
                     ...(locations.length > 0 && { locations }),
                     ...(content.length > 0 && { content }),
                     _meta: {
+                      lody: { toolName: "memory_recall" },
                       claudeCode: {
                         toolName: "memory_recall",
                         toolResponse: { mode: message.mode },
@@ -3399,6 +3482,7 @@ export class ClaudeAcpAgent {
                       },
                     ],
                     _meta: {
+                      lody: { toolName: message.tool_name },
                       claudeCode: {
                         toolName: message.tool_name,
                         ...(parentToolUseId ? { parentToolUseId } : {}),
@@ -3885,6 +3969,7 @@ export class ClaudeAcpAgent {
                   };
                 }
                 const usages: SessionUsageUpdate = {
+                  sessionId: params.sessionId,
                   usage: {
                     inputTokens: message.usage.input_tokens,
                     outputTokens: message.usage.output_tokens,
@@ -3894,13 +3979,13 @@ export class ClaudeAcpAgent {
                   modelUsage,
                 };
                 await extNotification(
-                  EXT_METHOD_NAME.usage_update,
+                  LODY_EXTENSION_METHODS.sessionUsageUpdate,
                   usages as unknown as Record<string, unknown>,
                 );
                 const limits = await getUsage();
-                if (limits && !limits.apiUnavailable) {
+                if (limits) {
                   await extNotification(
-                    EXT_METHOD_NAME.rate_limits,
+                    LODY_EXTENSION_METHODS.rateLimitsUpdate,
                     limits as unknown as Record<string, unknown>,
                   );
                 }
@@ -4628,6 +4713,7 @@ export class ClaudeAcpAgent {
                 toolCallId,
                 status: "in_progress",
                 _meta: {
+                  lody: { toolName: message.tool_name },
                   claudeCode: {
                     toolName: message.tool_name,
                     toolResponse: {
@@ -4658,7 +4744,6 @@ export class ClaudeAcpAgent {
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
                   size: session.contextWindowSize,
-                  _meta: { "_claude/rateLimit": message.rate_limit_info },
                 },
               });
             }
@@ -5617,9 +5702,10 @@ export class ClaudeAcpAgent {
               ),
               // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
               // so clients can rely on one shape everywhere.
-              ...(parentToolUseId
-                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-                : {}),
+              _meta: {
+                lody: { toolName },
+                claudeCode: { toolName, ...(parentToolUseId ? { parentToolUseId } : {}) },
+              } satisfies ToolUpdateMeta,
             },
           },
           toolName,
@@ -5706,9 +5792,10 @@ export class ClaudeAcpAgent {
             ),
             // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
             // so clients can rely on one shape everywhere.
-            ...(parentToolUseId
-              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-              : {}),
+            _meta: {
+              lody: { toolName },
+              claudeCode: { toolName, ...(parentToolUseId ? { parentToolUseId } : {}) },
+            } satisfies ToolUpdateMeta,
           },
         },
         toolName,
@@ -8149,6 +8236,16 @@ function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
   return candidates.find((candidate) => existsSync(candidate));
 }
 
+function toolMetaFromToolUse(
+  toolUse: { name: string; input?: unknown },
+  cwd?: string,
+): Pick<ToolUpdateMeta, "lody" | "claudeCode"> {
+  return {
+    lody: { toolName: toolUse.name },
+    claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
+  };
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -8165,7 +8262,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd) } satisfies ToolUpdateMeta,
+      _meta: toolMetaFromToolUse(toolUse, cwd) satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -8174,7 +8271,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
+      ...toolMetaFromToolUse(toolUse, cwd),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -8440,6 +8537,7 @@ export function toAcpNotifications(
                     : {};
                 const update: SessionNotification["update"] = {
                   _meta: {
+                    lody: { toolName },
                     claudeCode: {
                       toolResponse,
                       toolName,
@@ -8447,6 +8545,7 @@ export function toAcpNotifications(
                   } satisfies ToolUpdateMeta,
                   toolCallId: toolUseId,
                   sessionUpdate: "tool_call_update",
+                  rawOutput: toolResponse,
                   ...editDiff,
                 };
                 await client.sessionUpdate({
@@ -8556,6 +8655,7 @@ export function toAcpNotifications(
             sessionId,
             update: {
               _meta: {
+                lody: { toolName: toolUse.name },
                 claudeCode: {
                   toolName: toolUse.name,
                   ...(nonExecution ?? {}),
@@ -8649,6 +8749,7 @@ export function toAcpNotifications(
 
           update = {
             _meta: {
+              lody: { toolName: toolUse.name },
               claudeCode: {
                 toolName: toolUse.name,
                 ...(nonExecution ?? {}),
@@ -8914,13 +9015,15 @@ export function runAcp(logger?: Logger) {
     .onRequest(methods.agent.providers.set, (ctx) => agent.unstable_setProvider(ctx.params))
     .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
+    .onRequest<RateLimitsGetRequest, RateLimitsGetResponse>(
+      LODY_EXTENSION_METHODS.rateLimitsGet,
+      parseRateLimitsGetRequest,
+      (ctx) => agent.getRateLimits(ctx.params),
+    )
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
-    .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
-      agent.steer(ctx.params),
-    )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },

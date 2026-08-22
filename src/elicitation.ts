@@ -12,6 +12,7 @@ import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import type { LodyElicitationMeta } from "acp-extension-core";
 
 /**
  * Bridges between the Claude Agent SDK's elicitation/dialog callbacks and ACP's
@@ -140,21 +141,9 @@ function questionCustomFieldKey(index: number): string {
   return `question_${index}_custom`;
 }
 
-/**
- * `_meta` key under which a bridged enum option carries its `preview`, the one
- * option field ACP's `EnumOption` still has no slot for (descriptions are
- * first-class as of schema 1.19). Namespaced like the agent's other `_meta`
- * extensions (`_claude/...`).
- */
-const OPTION_META_KEY = "_claude/askUserQuestionOption";
-
-/**
- * Shared `_meta` key for marking a per-question free-text field as the custom
- * answer companion for a select question. This intentionally has no
- * agent-specific namespace so ACP clients can recognize the same marker across
- * Codex, Claude, and other AskUserQuestion bridges.
- */
-const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
+const lodyElicitationMeta = (meta: Omit<LodyElicitationMeta, "version">) => ({
+  lody: { elicitation: { version: 1 as const, ...meta } },
+});
 
 /**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
@@ -193,7 +182,7 @@ export function askUserQuestionsToCreateRequest(
       // on focus) still has no structural slot in `EnumOption`, so forward it
       // under ACP's reserved `_meta` extension point for clients that render it.
       if (option.preview) {
-        enumOption._meta = { [OPTION_META_KEY]: { preview: option.preview } };
+        enumOption._meta = lodyElicitationMeta({ preview: option.preview });
       }
       return enumOption;
     });
@@ -212,12 +201,7 @@ export function askUserQuestionsToCreateRequest(
       type: "string",
       title: "Other",
       description: "Type your own answer instead of choosing an option above (optional).",
-      _meta: {
-        [CUSTOM_ANSWER_META_KEY]: {
-          questionId: questionFieldKey(index),
-          isCustomAnswer: true,
-        },
-      },
+      _meta: lodyElicitationMeta({ customAnswerFor: questionFieldKey(index) }),
     };
   });
 

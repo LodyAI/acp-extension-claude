@@ -26,14 +26,10 @@
  *
  *   <text>          `session/prompt`. Typed mid-turn it is *buffered* by this
  *                   client and sent once the running turn responds.
- *   !steer <text>   `_session/steering` — injected into the turn that is
- *                   already running, so it can change course between tool
- *                   calls. Answers "injected", or "startedNewTurn" if the turn
- *                   beat us to the finish. An injected reply streams as
- *                   `session/update` notifications inside that turn, whose
- *                   `stopReason` waits for it. "startedNewTurn" output belongs
- *                   to a detached turn no `session/prompt` of ours tracks.
- *                   See ./steering.ts.
+ *   !steer <text>   `session/prompt` with `_meta.lody.steer.id`, delivered to
+ *                   the in-flight turn according to the advertised Lody
+ *                   steering capability. The agent acknowledges the id via
+ *                   `_lody/session/steer_applied`. See ./steering.ts.
  *   !queue <text>   `session/prompt` sent mid-turn anyway. The agent advertises
  *                   `promptQueueing`, so it takes the backlog instead of us —
  *                   same ordering, different owner.
@@ -71,6 +67,7 @@
  * form. That is the one intentional behaviour difference from a full client.
  */
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -85,27 +82,16 @@ import {
 } from "@agentclientprotocol/sdk";
 // Type-only: Node's type stripping does not elide value imports, and these two
 // exist only in the .d.ts — importing them normally is a runtime SyntaxError.
-import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
+import type { AnyMessage, PromptRequest, Stream } from "@agentclientprotocol/sdk";
+import {
+  LODY_EXTENSION_METHODS,
+  type LodyExtensionCapabilities,
+  type LodySteerApplied,
+} from "acp-extension-core";
 
 // ---------------------------------------------------------------- steering
 
-/**
- * The steering extension (../steering_protocol.md, and ./steering.ts for a
- * scripted walkthrough). It is not part of ACP proper, so it has no entry in
- * `methods` and is sent as a raw method name with hand-written types.
- */
-const STEERING_METHOD = "_session/steering";
-
-type SteeringRequest = {
-  sessionId: string;
-  prompt: Array<{ type: "text"; text: string }>;
-};
-
-/** Both outcomes are successes; they say where the message landed, not whether
- *  it worked. "startedNewTurn" means the turn finished before we got there. */
-type SteeringResponse = {
-  outcome: "injected" | "startedNewTurn";
-};
+/** Lody prompt-transport steering; see ./steering.ts for a scripted walkthrough. */
 
 // ---------------------------------------------------------------- arguments
 
@@ -154,7 +140,7 @@ if (
 /** Shown by `!help`, and once at startup. */
 const HELP = [
   "<text>          send it — as a new turn, or buffered until this turn ends",
-  "!steer <text>   inject into the running turn (_session/steering)",
+  "!steer <text>   inject with session/prompt + _meta.lody.steer",
   "!queue <text>   send session/prompt now and let the agent queue it",
   "!cancel         session/cancel the running turn (same as Ctrl-C)",
   "!help           this list; !! sends a line that really starts with '!'",
@@ -366,6 +352,11 @@ async function main() {
     .onNotification(methods.client.session.update, (ctx) => {
       lastUpdateKind = ctx.params.update.sessionUpdate;
     })
+    .onNotification<LodySteerApplied>(
+      LODY_EXTENSION_METHODS.sessionSteerApplied,
+      (params) => params as LodySteerApplied,
+      (ctx) => log(`steer applied: ${ctx.params.steerId}`),
+    )
     // Auto-approve, chosen by `kind` and never by a hard-coded optionId: for
     // ExitPlanMode this agent uses permission-*mode* names as option ids
     // (auto / acceptEdits / default / plan / bypassPermissions).
@@ -434,11 +425,11 @@ async function main() {
   agentReady = true;
   log(`connected to ${init.agentInfo?.name ?? "agent"} ${init.agentInfo?.version ?? ""}`.trim());
 
-  // Steering is advertised at the TOP-LEVEL `_meta` of the initialize result —
-  // a sibling of `agentCapabilities`, not nested inside it. Prompt queueing is
-  // a Claude-specific capability flag and does live inside.
-  const initMeta = init._meta as { steering?: { supported?: boolean } } | null | undefined;
-  const steeringSupported = initMeta?.steering?.supported === true;
+  // Lody capabilities and Claude's prompt-queueing flag both live under the
+  // agent-capability metadata, in separate namespaces.
+  const lodyCapabilities = init.agentCapabilities?._meta?.lody as
+    LodyExtensionCapabilities | undefined;
+  const steeringSupported = lodyCapabilities?.steering?.transport === "prompt";
   const queueMeta = init.agentCapabilities?._meta as
     { claudeCode?: { promptQueueing?: boolean } } | null | undefined;
   log(
@@ -466,8 +457,8 @@ async function main() {
   //                          buffered here and sent when the turn responds
   //      session/prompt      sent mid-turn anyway, so the *agent* queues it
   //        (!queue)          (it advertises `_meta.claudeCode.promptQueueing`)
-  //      _session/steering   injected into the turn that is already running
-  //        (!steer)
+  //      session/prompt      tagged with `_meta.lody.steer`, injected into the
+  //        (!steer)          turn that is already running
   //      session/cancel      abandon the running turn
   //        (!cancel, ^C)
   let draining = false;
@@ -560,22 +551,25 @@ async function main() {
     refreshPrompt();
   }
 
-  /** `_session/steering`: deliver a message to the turn already in progress. */
+  /** Deliver a correlated prompt to the turn already in progress. */
   async function steer(text: string) {
-    const params: SteeringRequest = { sessionId, prompt: [{ type: "text", text }] };
+    const steerId = randomUUID();
+    const params: PromptRequest = {
+      sessionId,
+      prompt: [{ type: "text", text }],
+      _meta: { lody: { steer: { id: steerId } } },
+    };
+    inFlight += 1;
+    refreshPrompt();
     try {
-      const result = await agent.request<SteeringResponse>(STEERING_METHOD, params);
-      // Either way the steered message's own output arrives as `session/update`
-      // notifications, not in this response. When injected, it lands inside the
-      // turn we steered, whose `stopReason` waits for it.
-      log(
-        result.outcome === "injected"
-          ? "steer outcome: injected into the running turn"
-          : "steer outcome: startedNewTurn — the turn had already finished, so the " +
-              "agent began a new one that no session/prompt of ours is tracking",
-      );
+      const result = await agent.request(methods.agent.session.prompt, params);
+      log(`steered turn ended: ${result.stopReason}`);
     } catch (err) {
       log(`steer rejected: ${err}`);
+    } finally {
+      inFlight -= 1;
+      refreshPrompt();
+      exitWhenIdle();
     }
   }
 

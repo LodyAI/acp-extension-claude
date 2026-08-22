@@ -1,32 +1,22 @@
 import { RequestError } from "@agentclientprotocol/sdk";
 import type { SDKActiveGoalMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  LODY_EXTENSION_METHODS,
+  type LodyGoalCapability,
+  type LodyGoalSnapshot,
+} from "acp-extension-core";
 
 export const GOAL_EXTENSION_VERSION = 1 as const;
-export const GOAL_CONTROL_METHOD = "_session/goal";
+export const GOAL_CONTROL_METHOD = LODY_EXTENSION_METHODS.sessionGoal;
 
 export const GOAL_ACTIONS = ["set", "clear"] as const;
 export type GoalAction = (typeof GOAL_ACTIONS)[number];
 
-export type GoalCapability = {
-  version: typeof GOAL_EXTENSION_VERSION;
-  controlMethod: typeof GOAL_CONTROL_METHOD;
-  actions: GoalAction[];
-};
+export type GoalCapability = LodyGoalCapability & { actions: GoalAction[] };
 
 export type GoalStatus = "active" | "paused" | "blocked" | "limited" | "complete";
 
-export type GoalSnapshot = {
-  objective: string;
-  status: GoalStatus;
-  iterations?: number;
-  lastReason?: string | null;
-  createdAt?: number;
-  updatedAt?: number;
-  tokenBudget?: number | null;
-  tokensUsed?: number;
-  timeUsedSeconds?: number;
-  controlMethod: typeof GOAL_CONTROL_METHOD;
-};
+export type GoalSnapshot = LodyGoalSnapshot;
 
 export type GoalRequest =
   { sessionId: string; action: "clear" } | { sessionId: string; action: "set"; objective: string };
@@ -45,7 +35,6 @@ export function goalUpdateFromPrompt(prompt: string): GoalSnapshot | null | unde
   return {
     objective: argument,
     status: "active",
-    controlMethod: GOAL_CONTROL_METHOD,
   };
 }
 
@@ -77,7 +66,6 @@ export function toGoalSnapshot(message: SDKActiveGoalMessage): GoalSnapshot | nu
     status: "active",
     iterations: message.value.iterations,
     lastReason: message.value.last_reason ?? null,
-    createdAt: message.value.set_at,
-    controlMethod: GOAL_CONTROL_METHOD,
+    createdAtEpochSeconds: Math.floor(message.value.set_at / 1000),
   };
 }

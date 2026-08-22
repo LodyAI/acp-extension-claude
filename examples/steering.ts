@@ -1,5 +1,5 @@
 /**
- * Example: mid-turn steering over ACP with the `_session/steering` extension.
+ * Example: mid-turn steering over ACP with the Lody extension contract.
  *
  * "Steering" lets a client deliver a follow-up message to a turn that is still
  * running, instead of waiting for it to finish and sending a fresh
@@ -10,16 +10,12 @@
  *
  * The wire protocol has three moving parts:
  *
- *   1. The agent advertises support in its `initialize` response, at the
- *      top-level `_meta.steering` (a sibling of `agentCapabilities`).
- *   2. The client calls the `_session/steering` request with `{ sessionId,
- *      prompt }` while a turn is running.
- *   3. The agent replies with an `outcome`:
- *        - "injected"       the message joined the running turn;
- *        - "startedNewTurn" the turn had already finished and the legacy
- *                           detached fallback was used;
- *        - "promptRequired" the turn had already finished, but this request
- *                           explicitly opted into Host-owned prompt delivery.
+ *   1. The agent advertises `agentCapabilities._meta.lody.steering` with
+ *      `transport: "prompt"` in its `initialize` response.
+ *   2. The client sends a standard `session/prompt` while a turn is running,
+ *      correlating it with a unique `_meta.lody.steer.id`.
+ *   3. Before forwarding the steered output, the agent sends
+ *      `_lody/session/steer_applied` with that id.
  *
  * This example launches the agent as a subprocess, starts a deliberately
  * long-running prompt, and — as soon as the agent begins streaming — injects a
@@ -37,6 +33,7 @@
  * be authenticated, since it talks to the real model.
  */
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -47,32 +44,11 @@ import {
   type PromptRequest,
   type PromptResponse,
 } from "@agentclientprotocol/sdk";
-
-/** The steering extension method, per the ACP steering wire protocol. */
-const STEERING_METHOD = "_session/steering";
-
-/** Params for a `_session/steering` request — the same shape as the relevant
- *  subset of a `session/prompt`. */
-type SteeringRequest = {
-  sessionId: string;
-  prompt: Array<{ type: "text"; text: string }>;
-  _meta?: { steering?: { idleBehavior?: "promptRequired" } };
-};
-
-/** Result of a `_session/steering` request. `injected` means the message joined
- *  the running turn; `promptRequired` means the turn had already settled, so the
- *  message was NOT consumed and must be (re)sent through a normal
- *  `session/prompt`. Both are successes. */
-type SteeringResponse =
-  | { outcome: "injected" }
-  | { outcome: "startedNewTurn" }
-  | { outcome: "promptRequired"; reason: "noRunningTurn" };
-
-/** The existing steering capability advertised at the top-level `_meta.steering`
- *  of the `initialize` result. The idle behavior is selected per request. */
-type SteeringCapability = {
-  supported?: boolean;
-};
+import {
+  LODY_EXTENSION_METHODS,
+  type LodyExtensionCapabilities,
+  type LodySteerApplied,
+} from "acp-extension-core";
 
 // The built agent entry. Run `npm run build` first so this exists.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -115,6 +91,9 @@ async function main() {
     // the turn is genuinely underway and therefore steerable.
     let signalFirstOutput = () => {};
     const firstOutput = new Promise<void>((resolve) => (signalFirstOutput = resolve));
+    let expectedSteerId: string | undefined;
+    let signalSteerApplied = () => {};
+    const steerApplied = new Promise<void>((resolve) => (signalSteerApplied = resolve));
 
     const connection = acpClient({ name: "steering-example" })
       .onNotification(methods.client.session.update, (ctx) => {
@@ -124,6 +103,13 @@ async function main() {
           signalFirstOutput();
         }
       })
+      .onNotification<LodySteerApplied>(
+        LODY_EXTENSION_METHODS.sessionSteerApplied,
+        (params) => params as LodySteerApplied,
+        (ctx) => {
+          if (ctx.params.steerId === expectedSteerId) signalSteerApplied();
+        },
+      )
       // Auto-approve permission prompts so the turn is never blocked on us.
       .onRequest(methods.client.session.requestPermission, (ctx) => {
         const options = ctx.params.options;
@@ -138,19 +124,17 @@ async function main() {
     try {
       const agent = connection.agent;
 
-      // 1. Initialize and confirm the agent advertises steering. Per the wire
-      //    protocol the capability lives at the TOP-LEVEL `_meta` of the initialize
-      //    result — a sibling of `agentCapabilities`, not nested inside it.
+      // 1. Initialize and confirm the agent advertises prompt-transport steering.
       const init = await agent.request(methods.agent.initialize, {
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
       });
-      const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)
-        ?.steering;
-      if (steering?.supported !== true) {
-        throw new Error("agent does not advertise steering support");
+      const capabilities = init.agentCapabilities?._meta?.lody as
+        LodyExtensionCapabilities | undefined;
+      if (capabilities?.steering?.transport !== "prompt") {
+        throw new Error("agent does not advertise prompt-transport steering");
       }
-      log("agent advertises steering support");
+      log("agent advertises prompt-transport steering");
 
       // 2. Open a session.
       const { sessionId } = await agent.request(methods.agent.session.new, {
@@ -176,34 +160,24 @@ async function main() {
 
       process.stdout.write("\n");
       log(`steer: ${STEER}`);
-      const steerRequest: SteeringRequest = {
+      const steerId = randomUUID();
+      expectedSteerId = steerId;
+      const steerRequest: PromptRequest = {
         sessionId,
         prompt: [{ type: "text", text: STEER }],
-        // Opt into the host-owned idle fallback. Without this request metadata,
-        // the Adapter preserves its legacy `startedNewTurn` behavior.
-        _meta: { steering: { idleBehavior: "promptRequired" } },
+        _meta: { lody: { steer: { id: steerId } } },
       };
-      const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
-      log(`steer outcome: ${result.outcome}`);
+      const steeredTurn = agent.request<PromptResponse, PromptRequest>(
+        methods.agent.session.prompt,
+        steerRequest,
+      );
+      await steerApplied;
+      log(`steer applied: ${steerId}`);
+      const steeredResponse = await steeredTurn;
+      log(`steered turn stopReason: ${steeredResponse.stopReason}`);
 
-      if (result.outcome === "promptRequired") {
-        // The target turn already settled, so steering did not consume the message.
-        // Start a normal session/prompt on the same session to deliver it — that
-        // request owns the continuation's updates and terminal response.
-        log(`steer fallback: ${result.reason}; starting a normal session/prompt`);
-        const continuationRequest: PromptRequest = {
-          sessionId: steerRequest.sessionId,
-          prompt: steerRequest.prompt,
-        };
-        const continuation = await agent.request<PromptResponse, PromptRequest>(
-          methods.agent.session.prompt,
-          continuationRequest,
-        );
-        log(`continuation stopReason: ${continuation.stopReason}`);
-      }
-
-      // 5. Await the original turn. With outcome "injected" the steer already
-      //    reshaped the output above; the promptRequired branch owns its own turn.
+      // 5. Await the original turn. The correlated prompt already reshaped its
+      //    output above and has its own standard prompt response.
       const response = await turn;
       log(`original turn stopReason: ${response.stopReason}`);
       process.stdout.write("\n----- end of agent output -----\n");
