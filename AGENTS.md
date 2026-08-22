@@ -13,8 +13,7 @@ npm run lint:fix      # eslint --fix
 npm run format        # prettier --write
 ```
 
-CI runs `format:check`, `lint`, `build` and `test:run`. Run `npm run check` before
-opening a PR.
+Run `npm run check` before opening a PR.
 
 ## Pull Requests
 
