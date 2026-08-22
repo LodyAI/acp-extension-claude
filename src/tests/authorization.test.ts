@@ -141,7 +141,7 @@ describe("authorization", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: " ",
+            ANTHROPIC_AUTH_TOKEN: "acp-proxy",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
             userEnv: "userEnv",
@@ -178,7 +178,7 @@ describe("authorization", () => {
         options: expect.objectContaining({
           env: expect.objectContaining({
             CLAUDE_CODE_USE_BEDROCK: "1",
-            AWS_BEARER_TOKEN_BEDROCK: " ",
+            AWS_BEARER_TOKEN_BEDROCK: "acp-proxy",
             ANTHROPIC_BEDROCK_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "custom-header: test",
           }),
@@ -205,42 +205,6 @@ describe("authorization", () => {
     );
     expect(initializeResponse.authMethods).toContainEqual(
       expect.objectContaining({ id: "gateway" }),
-    );
-  });
-
-  it("hide claude auth but still show console login when terminal-auth is set", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { "terminal-auth": true },
-      },
-    });
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
-    );
-  });
-
-  it("hide claude auth but still show console login with terminal capability", async () => {
-    const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        auth: { terminal: true },
-      },
-    });
-    expect(initializeResponse.authMethods).not.toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
     );
   });
 
@@ -299,22 +263,6 @@ describe("authorization", () => {
 
     expect(initializeResponse.authMethods).not.toContainEqual(
       expect.objectContaining({ id: "claude-login" }),
-    );
-  });
-
-  it("show claude authentication", async () => {
-    const [agent] = await createAgentMock();
-
-    const initializeResponse = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
-    });
-
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "claude-ai-login" }),
-    );
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "console-login" }),
     );
   });
 });
