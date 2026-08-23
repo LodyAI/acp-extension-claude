@@ -1,10 +1,6 @@
 {
   "name": "acp-extension-claude",
   "version": "0.70.0",
-  "lodyManagedRuntime": {
-    "name": "claude-code",
-    "compatibilityVersion": 1
-  },
   "description": "Forked ACP-compatible coding agent with improved timeout handling and logging",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
