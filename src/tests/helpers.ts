@@ -4,9 +4,9 @@
  * their own vi.fn spies via `overrides`.
  */
 
-/** The context-usage report the base mock query returns. `rawMaxTokens`
- *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions
- *  don't shift in tests that don't care about context usage. */
+/** The context-usage report the base mock query returns. `rawMaxTokens` uses a
+ *  common 200k window so assertions don't shift in tests that don't care about
+ *  context usage. */
 export const DEFAULT_CONTEXT_USAGE = { totalTokens: 0, rawMaxTokens: 200000 };
 
 /**

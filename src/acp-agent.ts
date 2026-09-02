@@ -309,7 +309,6 @@ function createClaudeTaskLifecycleUpdate(
     : { sessionUpdate: "tool_call_update", ...update };
 }
 
-const DEFAULT_CONTEXT_WINDOW = 200000;
 export const CLAUDE_STEER_APPLIED_METHOD = LODY_EXTENSION_METHODS.sessionSteerApplied;
 
 export const CLAUDE_LODY_CAPABILITIES = {
@@ -672,19 +671,18 @@ export type Session = {
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
-   *  resumed session's own `getContextUsage` report wins, see
+   *  text heuristic (`null` when both miss; on session/load the resumed
+   *  session's own `getContextUsage` report wins, see
    *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
    *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
    *  fresh session it stalls until the first turn runs (see the seeding call
    *  sites and `contextWindowCache`). */
-  contextWindowSize: number;
+  contextWindowSize: number | null;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a resumed session's `getContextUsage` report, or a
-   *  `result.modelUsage`) rather than the text heuristic / default. Guards the
-   *  mid-stream `message_start` heuristic upgrade: an authoritative window that
-   *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
-   *  and clobbered by a "1m" text match. */
+   *  `result.modelUsage`) rather than the text heuristic. Guards the
+   *  mid-stream `message_start` heuristic so it cannot clobber an authoritative
+   *  value. */
   contextWindowAuthoritative: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
@@ -3228,14 +3226,16 @@ export class ClaudeAcpAgent {
                   },
                 });
                 compactionInProgress = null;
-                await sendUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "usage_update",
-                    used: lastAssistantTotalUsage,
-                    size: session.contextWindowSize,
-                  },
-                });
+                if (session.contextWindowSize !== null) {
+                  await sendUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "usage_update",
+                      used: lastAssistantTotalUsage,
+                      size: session.contextWindowSize,
+                    },
+                  });
+                }
                 break;
               }
               case "local_command_output": {
@@ -3929,7 +3929,7 @@ export class ClaudeAcpAgent {
               }
 
               // Send usage_update notification
-              if (lastAssistantTotalUsage !== null) {
+              if (lastAssistantTotalUsage !== null && session.contextWindowSize !== null) {
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -4295,18 +4295,14 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
-                  // Only upgrade from the heuristic default — once we have an
+                  // Only upgrade while the window is unknown — once we have an
                   // authoritative window (cache-seeded at session creation or
                   // on a model switch, read from the resumed session on
                   // session/load, confirmed by each `result`), trust it over
-                  // the heuristic. The flag, not the value, is the sentinel: an
-                  // authoritative window can legitimately equal
-                  // DEFAULT_CONTEXT_WINDOW (e.g. a backend serving a 200k lane
-                  // under a "[1m]"-spelled id) and must not be clobbered.
-                  if (
-                    !session.contextWindowAuthoritative &&
-                    session.contextWindowSize === DEFAULT_CONTEXT_WINDOW
-                  ) {
+                  // the heuristic. An authoritative value, including 200k from
+                  // a backend serving a narrower lane under a "[1m]"-spelled
+                  // id, must not be clobbered.
+                  if (!session.contextWindowAuthoritative && session.contextWindowSize === null) {
                     const inferred = inferContextWindowFromModel(model);
                     if (inferred !== null) {
                       session.contextWindowSize = inferred;
@@ -4333,14 +4329,16 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
-                await sendUpdate({
-                  sessionId: params.sessionId,
-                  update: {
-                    sessionUpdate: "usage_update",
-                    used: nextUsage,
-                    size: session.contextWindowSize,
-                  },
-                });
+                if (session.contextWindowSize !== null) {
+                  await sendUpdate({
+                    sessionId: params.sessionId,
+                    update: {
+                      sessionUpdate: "usage_update",
+                      used: nextUsage,
+                      size: session.contextWindowSize,
+                    },
+                  });
+                }
               }
             }
             for (const notification of streamEventToAcpNotifications(
@@ -4737,7 +4735,7 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
-            if (lastAssistantTotalUsage !== null) {
+            if (lastAssistantTotalUsage !== null && session.contextWindowSize !== null) {
               await sendUpdate({
                 sessionId: message.session_id,
                 update: {
@@ -6017,19 +6015,28 @@ export class ClaudeAcpAgent {
       if (session.models.currentModelId !== value) {
         // Seed the new model's context window WITHOUT any IPC on the switch
         // path: cached authoritative value if we've already learned it (from a
-        // prior turn's `result.modelUsage`), else the text heuristic, else the
-        // default. We deliberately do NOT call `getContextUsage` here — before
+        // prior turn's `result.modelUsage`), else the text heuristic, else
+        // unknown. We deliberately do NOT call `getContextUsage` here — before
         // a fresh session's first prompt turn that control request is not
         // serviced (~15s stall, issues #886/#880), and (because SDK control
         // requests are serialized over one channel) it would drag the awaited
         // `setModel` down with it. The authoritative window arrives on the
         // first `result.modelUsage` for the model and is cached from there;
-        // until then a switched-to alias that has never run a turn shows the
-        // heuristic/default window, which self-corrects on its first response
-        // (matches pre-0.59.0 behavior).
+        // until then a switched-to alias that has never run a turn shows no
+        // context usage, which self-corrects on its first response.
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
+        if (seeded.size === null) {
+          // ACP requires numeric usage fields. A zero-sized update is the
+          // protocol-level clear sentinel understood by Lody, preventing the
+          // previous model's context usage from lingering while the new
+          // model's window is still unknown.
+          await this.client.sessionUpdate({
+            sessionId,
+            update: { sessionUpdate: "usage_update", used: 0, size: 0 },
+          });
+        }
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -6876,7 +6883,7 @@ export class ClaudeAcpAgent {
     // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
     // authoritative and wins. Otherwise: the cached authoritative window if a
     // prior turn has learned it for this model (`result.modelUsage`,
-    // cross-session), else the text heuristic, else the default. We
+    // cross-session), else the text heuristic, else unknown. We
     // deliberately do NOT issue a getContextUsage call here: on a fresh
     // session that control request is not serviced until the first prompt
     // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
@@ -6886,10 +6893,10 @@ export class ClaudeAcpAgent {
     // Text inference alone misses aliases that resolve to extended-context
     // models with no "1m" token anywhere in their id or description (e.g.
     // `sonnet` → claude-sonnet-5, natively ~1M): those stream
-    // `usage_update.size: 200000` until the first result's modelUsage corrects
-    // it — but the cache means only the FIRST session to ever run a turn on such
-    // a model eats that window, not every fresh session after a process
-    // restart (issue #596; a post-restart session/load is covered by the
+    // no context usage until the first result's modelUsage supplies the window.
+    // The cache means only the first session to run a turn on such a model has
+    // an unknown window; later fresh sessions in the same process seed it
+    // immediately (issue #596; a post-restart session/load is covered by the
     // resumed report above).
     //
     // The inference fallback is deliberately keyed to the allowlisted entry: a
@@ -9055,8 +9062,8 @@ function commonPrefixLength(a: string, b: string) {
  *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
  *  This text scan can't catch every model — some resolve to extended-context
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M). Such a miss falls back to the default window and is corrected by
- *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
+ *  ~1M). Such a miss stays unknown and is corrected by `result.modelUsage`
+ *  (and cached) within one turn. We do NOT consult the
  *  SDK's `getContextUsage` to close that gap: on a fresh session it is not
  *  serviced before the first prompt turn (issues #886/#880, see
  *  `contextWindowCache`; resumed sessions do get it, via
@@ -9161,29 +9168,27 @@ function cacheContextWindow(modelKey: string, window: number): void {
 /** The context window to report *right now* for a model, with NO IPC on the
  *  critical path: the cached authoritative value if we've learned it (from a
  *  prior turn's `result.modelUsage`, this or any session on the same backend),
- *  else the text heuristic over the model row's identity strings, else the
- *  default. Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
+ *  else the text heuristic over the model row's identity strings, else `null`.
+ *  Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
  *  the same rule at every seed site — so read keys can't drift from the write
  *  site's spelling. `authoritative` reports whether the value came from the
- *  cache: an authoritative window can legitimately equal
- *  DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the caller. */
+ *  cache. */
 function immediateContextWindow(
   providerCacheKey: string,
   modelId: string,
   modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
-): { size: number; authoritative: boolean } {
+): { size: number | null; authoritative: boolean } {
   const cached = contextWindowCache.get(
     contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
   );
   if (cached !== undefined) return { size: cached, authoritative: true };
   return {
-    size:
-      inferContextWindowFromModel(
-        modelId,
-        modelInfo?.resolvedModel,
-        modelInfo?.displayName,
-        modelInfo?.description,
-      ) ?? DEFAULT_CONTEXT_WINDOW,
+    size: inferContextWindowFromModel(
+      modelId,
+      modelInfo?.resolvedModel,
+      modelInfo?.displayName,
+      modelInfo?.description,
+    ),
     authoritative: false,
   };
 }

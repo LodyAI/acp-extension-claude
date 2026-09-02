@@ -689,15 +689,15 @@ describe("createSession options merging", () => {
       expect(ctxSpy).not.toHaveBeenCalled();
     });
 
-    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+    it("leaves contextWindowSize unknown when text inference misses", async () => {
       // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the window falls back to
-      // the default; the authoritative value arrives later via result.modelUsage.
+      // no "1m" token anywhere, so inference misses and the window stays hidden;
+      // the authoritative value arrives later via result.modelUsage.
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBeNull();
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
@@ -708,7 +708,7 @@ describe("createSession options merging", () => {
       // module cache is empty and text inference misses natively-1M aliases, so
       // discarding this in-hand value would replay the issue-#596 flicker on
       // every reload — the flagship scenario. 888_000 can only come from the
-      // report: inference on the mock model yields null → 200_000 default.
+      // report: inference on the mock model yields null.
       contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
 
       await (

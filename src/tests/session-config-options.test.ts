@@ -957,13 +957,13 @@ describe("session config options", () => {
       expect(session.contextWindowSize).toBe(1_000_000);
     });
 
-    it("falls back to the default window when inference misses, without any getContextUsage IPC", async () => {
+    it("clears context usage when inference misses, without any getContextUsage IPC", async () => {
       const session = getSession();
       session.contextWindowSize = 1_000_000;
       // Present but must NOT be called; the switch never consults it.
       session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
       // claude-sonnet-4-6 carries no "1m" token in its id, resolvedModel,
-      // displayName, or description, so inference misses → default window.
+      // displayName, or description, so inference misses → unknown window.
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -972,7 +972,11 @@ describe("session config options", () => {
       });
 
       expect(session.query.getContextUsage).not.toHaveBeenCalled();
-      expect(session.contextWindowSize).toBe(200000);
+      expect(session.contextWindowSize).toBeNull();
+      expect(sessionUpdates).toContainEqual({
+        sessionId: SESSION_ID,
+        update: { sessionUpdate: "usage_update", used: 0, size: 0 },
+      });
     });
 
     it("does not call getContextUsage even when switching to a fresh model", async () => {
