@@ -30,6 +30,12 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
 ## ACP Turn Forks
 
+- Usage model weekly sub-caps come from the OAuth response's `limits` array
+  (`weekly_scoped`, `percent`, `scope.model.display_name`), not invented
+  `seven_day_<model>` keys. Emit them as labeled Core windows alongside the
+  shared quotas in the same `claude` snapshot, including zero-use windows
+  without a reset. Never deduplicate quotas by percentage or reset time.
+
 - Agent message updates expose the top-level Claude SDK assistant uuid as
   `_meta.lody.turnId`. `_meta.lody.forkAtTurn.turnId` returns that value unchanged
   and passes it directly to `resumeSessionAt`; do not maintain a message-id mapping.
