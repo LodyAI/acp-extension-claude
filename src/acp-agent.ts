@@ -6947,6 +6947,7 @@ export class ClaudeAcpAgent {
       sessionId,
       modes,
       configOptions,
+      ...buildModelCapabilitiesMeta(modelInfos),
     };
   }
 
@@ -7329,6 +7330,46 @@ export function clientSupportsBooleanConfigOptions(
   clientCapabilities?: ClientCapabilities | null,
 ): boolean {
   return clientCapabilities?.session?.configOptions?.boolean != null;
+}
+
+/**
+ * Publishes what each model can do, not just what the current one can.
+ *
+ * `configOptions` is rebuilt on every model switch — the Fast toggle is present
+ * only while `supportsFastMode`, and the effort list belongs to the current
+ * model — so a client reading it learns nothing about any other model, and ACP
+ * offers no request that asks. The SDK already told us this for every model in
+ * `ModelInfo`; it was simply being dropped.
+ *
+ * Self-declared and advisory: it describes this account at this moment, and the
+ * live session state stays the authority.
+ */
+export function buildModelCapabilitiesMeta(modelInfos: ModelInfo[]): {
+  _meta?: Record<string, unknown>;
+} {
+  if (modelInfos.length === 0) {
+    return {};
+  }
+  return {
+    _meta: {
+      lody: {
+        modelCapabilities: {
+          version: 1,
+          models: Object.fromEntries(
+            modelInfos.map((info) => [
+              info.value,
+              {
+                ...(info.supportsEffort && info.supportedEffortLevels
+                  ? { effortValues: [...info.supportedEffortLevels] }
+                  : {}),
+                fastMode: info.supportsFastMode === true,
+              },
+            ]),
+          ),
+        },
+      },
+    },
+  };
 }
 
 /** Build the Fast mode config option. When the Client supports boolean config
