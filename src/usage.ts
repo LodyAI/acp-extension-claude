@@ -6,6 +6,7 @@ import * as os from "os";
 import * as https from "https";
 import { execFileSync } from "child_process";
 import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
+import { z } from "zod";
 
 interface CredentialsFile {
   claudeAiOauth?: {
@@ -19,6 +20,7 @@ interface CredentialsFile {
 }
 
 interface UsageApiResponse {
+  limits?: unknown;
   five_hour?: {
     utilization?: number;
     resets_at?: string;
@@ -28,6 +30,15 @@ interface UsageApiResponse {
     resets_at?: string;
   };
 }
+
+const ScopedWeeklyLimitSchema = z.object({
+  kind: z.literal("weekly_scoped"),
+  percent: z.number(),
+  resets_at: z.string().nullish(),
+  scope: z.object({
+    model: z.object({ display_name: z.string().trim().min(1) }),
+  }),
+});
 
 const KEYCHAIN_TIMEOUT_MS = 5000;
 const KEYCHAIN_BACKOFF_MS = 60_000; // Backoff on keychain failures to avoid re-prompting
@@ -105,6 +116,26 @@ export async function getUsage(
         windowDurationSeconds: 7 * 24 * 60 * 60,
         resetsAtEpochSeconds: sevenDayResetAt,
       });
+    }
+
+    // Model weekly sub-caps (including Fable) arrive in the dynamic limits
+    // array, not as seven_day_<model> fields. Keep them beside the shared
+    // windows even when they have identical utilization/reset values.
+    if (Array.isArray(apiResponse.limits)) {
+      for (const rawLimit of apiResponse.limits) {
+        const parsed = ScopedWeeklyLimitSchema.safeParse(rawLimit);
+        if (!parsed.success) continue;
+        const limit = parsed.data;
+        const usedPercent = parseUtilization(limit.percent);
+        if (usedPercent === null) continue;
+        const window = {
+          label: limit.scope.model.display_name,
+          usedPercent,
+          windowDurationSeconds: 7 * 24 * 60 * 60,
+          resetsAtEpochSeconds: parseDate(limit.resets_at ?? undefined),
+        };
+        windows.push(window);
+      }
     }
 
     const result: RateLimitsSnapshot = {
