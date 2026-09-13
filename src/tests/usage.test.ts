@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getUsage, type UsageApiDeps } from "../usage.js";
+import { accountingDelta, getUsage, toAccountingModelUsage, type UsageApiDeps } from "../usage.js";
 
 const resetAt = "2026-09-07T00:00:00Z";
 const shared = {
@@ -24,6 +24,52 @@ const usage = (response: Awaited<ReturnType<UsageApiDeps["fetchApi"]>>) =>
   });
 
 describe("OAuth usage windows", () => {
+  it("differences query-wide model usage, keeping unknown cost and resets explicit", () => {
+    const row = (inputTokens: number) => ({
+      inputTokens,
+      outputTokens: 10,
+      cacheReadInputTokens: 20,
+    });
+    const previous = { main: row(100) };
+    const next = { main: row(150), child: row(30) };
+    expect(accountingDelta(next, previous)?.usage).toMatchObject({
+      inputTokens: 80,
+      outputTokens: 10,
+    });
+    expect(accountingDelta(next, previous)?.usage.costUSD).toBeUndefined();
+    expect(accountingDelta(next, next)?.usage.inputTokens).toBe(0);
+    expect(accountingDelta({ main: row(20) }, previous)).toBeUndefined();
+    expect(
+      accountingDelta({ main: { ...row(150), costUSD: 1 } }, previous)?.usage.costUSD,
+    ).toBeUndefined();
+  });
+  it("splits SDK thinking without double counting and omits guessed cost", () => {
+    const raw = {
+      inputTokens: 10,
+      outputTokens: 100,
+      thinkingTokens: 40,
+      cacheReadInputTokens: 20,
+      cacheCreationInputTokens: 30,
+      webSearchRequests: 2,
+      costUSD: 0.5,
+      contextWindow: 200000,
+      maxOutputTokens: 1000,
+    };
+    expect(toAccountingModelUsage(raw)).toEqual({
+      inputTokens: 10,
+      outputTokens: 60,
+      reasoningOutputTokens: 40,
+      cacheReadInputTokens: 20,
+      cacheCreationInputTokens: 30,
+      webSearchRequests: 2,
+      costUSD: 0.5,
+      contextWindow: 200000,
+    });
+    expect(toAccountingModelUsage({ ...raw, costBasis: "unknown" }).costUSD).toBeUndefined();
+    const { thinkingTokens, ...legacy } = raw;
+    expect(toAccountingModelUsage(legacy).outputTokens).toBe(100);
+    expect(toAccountingModelUsage(legacy).reasoningOutputTokens).toBeUndefined();
+  });
   it("keeps Fable weekly usage beside the shared 5h and weekly constraints", async () => {
     const result = await usage({ ...shared, limits: [scoped("Fable", 67)] });
     expect(result).toEqual({

@@ -30,6 +30,11 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
 ## ACP Turn Forks
 
+- SDK usage is query-cumulative by model, not top-level per-turn usage. Split
+  thinking out of output. Preserve unknown costs across later guessed/known
+  snapshots; delta uses the last emitted query baseline and is omitted on a
+  counter decrease. Cancellation does not erase already billed result usage.
+
 - Usage model weekly sub-caps come from the OAuth response's `limits` array
   (`weekly_scoped`, `percent`, `scope.model.display_name`), not invented
   `seven_day_<model>` keys. Emit them as labeled Core windows alongside the

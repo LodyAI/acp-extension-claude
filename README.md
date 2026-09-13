@@ -30,6 +30,12 @@ acknowledged steering, goals, subagent/background-task lifecycle, and compaction
 ACP-standard elicitation, plans, session forking, and context-window usage remain
 on their standard protocol paths.
 
+Usage accounting preserves SDK query-wide model totals (including subagents),
+splits available thinking tokens from output, and emits already-included deltas
+between query snapshots. Guessed prices are omitted, including later cumulative
+totals containing an earlier guess. A decreasing counter has no inferred delta;
+same-ID resume/reset accounting still requires a consumer lifetime/baseline policy.
+
 For acknowledged steering, a client attaches a unique `_meta.lody.steer.id` to
 `session/prompt`. The adapter maps only those prompts to
 `SDKUserMessage.priority = "now"`; ordinary prompts keep the SDK's default

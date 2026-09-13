@@ -7,6 +7,64 @@ import * as https from "https";
 import { execFileSync } from "child_process";
 import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
 import { z } from "zod";
+import type { ModelUsage as SdkModelUsage } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelUsage } from "acp-extension-core";
+
+/** SDK thinking is a subset of output; costBasis=unknown is a guessed rate,
+ * not a known cost. Callers must also remember earlier unknown costs in a query. */
+export function toAccountingModelUsage(usage: SdkModelUsage): ModelUsage {
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: Math.max(0, usage.outputTokens - (usage.thinkingTokens ?? 0)),
+    cacheReadInputTokens: usage.cacheReadInputTokens,
+    cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    ...(usage.thinkingTokens === undefined ? {} : { reasoningOutputTokens: usage.thinkingTokens }),
+    webSearchRequests: usage.webSearchRequests,
+    ...(usage.costBasis === "unknown" ? {} : { costUSD: usage.costUSD }),
+    contextWindow: usage.contextWindow,
+  };
+}
+
+/** Differences SDK query snapshots, including subagents. A decreasing counter
+ * indicates an unknown/reset baseline, not a negative bill or a new full turn. */
+export function accountingDelta(
+  current: Record<string, ModelUsage>,
+  previous: Record<string, ModelUsage> = {},
+) {
+  const keys = [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "reasoningOutputTokens",
+    "webSearchRequests",
+  ] as const;
+  const usage: ModelUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0 };
+  const modelUsage: Record<string, ModelUsage> = {};
+  let knownCost = Object.keys(current).length > 0;
+  let cost = 0;
+  for (const [model, row] of Object.entries(current)) {
+    const old = previous[model];
+    const delta: ModelUsage = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0 };
+    for (const key of keys) {
+      const difference = (row[key] ?? 0) - (old?.[key] ?? 0);
+      if (difference < 0) return undefined;
+      delta[key] = difference;
+      usage[key] = (usage[key] ?? 0) + difference;
+    }
+    if (
+      row.costUSD !== undefined &&
+      (!old || old.costUSD !== undefined) &&
+      row.costUSD >= (old?.costUSD ?? 0)
+    ) {
+      delta.costUSD = row.costUSD - (old?.costUSD ?? 0);
+      cost += delta.costUSD;
+    } else knownCost = false;
+    modelUsage[model] = delta;
+  }
+  if (knownCost) usage.costUSD = cost;
+  return { usage, modelUsage };
+}
 
 interface CredentialsFile {
   claudeAiOauth?: {
