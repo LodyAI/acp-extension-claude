@@ -177,9 +177,8 @@ import {
   type ModelUsage as ModelUsageExt,
   type RateLimitsGetRequest,
   type RateLimitsGetResponse,
-  type SessionUsageUpdate,
 } from "acp-extension-core";
-import { getUsage } from "./usage.js";
+import { accountingDelta, getUsage, toAccountingModelUsage } from "./usage.js";
 
 type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
   availableCommands: AvailableCommand[];
@@ -529,6 +528,8 @@ function getClientSteerId(meta: PromptRequest["_meta"]): string | undefined {
 }
 
 export type Session = {
+  unknownUsageCostModels?: Set<string>;
+  usageBaseline?: Record<string, ModelUsageExt>;
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -3947,28 +3948,19 @@ export class ClaudeAcpAgent {
                 });
               }
 
-              if (session.cancelled) {
-                if (!isAutonomousResult) {
-                  await clearFailuresFromEarlierTurns();
-                  stopReason = "cancelled";
-                }
-                break;
-              }
-
               const extNotification = this.client.extNotification?.bind(this.client);
               if (extNotification) {
                 const modelUsage: Record<string, ModelUsageExt> = {};
                 for (const [model, usage] of Object.entries(message.modelUsage)) {
-                  modelUsage[model] = {
-                    inputTokens: usage.inputTokens,
-                    outputTokens: usage.outputTokens,
-                    cacheReadInputTokens: usage.cacheReadInputTokens,
-                    cacheCreationInputTokens: usage.cacheCreationInputTokens,
-                    webSearchRequests: usage.webSearchRequests,
-                    costUSD: usage.costUSD,
-                  };
+                  modelUsage[model] = toAccountingModelUsage(usage);
+                  if (usage.costBasis === "unknown") {
+                    (session.unknownUsageCostModels ??= new Set()).add(model);
+                  }
+                  // costBasis describes the latest request, but costUSD includes
+                  // earlier requests. A later known rate cannot validate old guesses.
+                  if (session.unknownUsageCostModels?.has(model)) delete modelUsage[model].costUSD;
                 }
-                const usages: SessionUsageUpdate = {
+                const usages = {
                   sessionId: params.sessionId,
                   usage: {
                     inputTokens: message.usage.input_tokens,
@@ -3977,11 +3969,13 @@ export class ClaudeAcpAgent {
                     cacheReadInputTokens: message.usage.cache_read_input_tokens,
                   },
                   modelUsage,
+                  delta: accountingDelta(modelUsage, session.usageBaseline),
                 };
                 await extNotification(
                   LODY_EXTENSION_METHODS.sessionUsageUpdate,
                   usages as unknown as Record<string, unknown>,
                 );
+                session.usageBaseline = modelUsage;
                 const limits = await getUsage();
                 if (limits) {
                   await extNotification(
@@ -3989,6 +3983,15 @@ export class ClaudeAcpAgent {
                     limits as unknown as Record<string, unknown>,
                   );
                 }
+              }
+
+              // A cancelled result can still contain billed work.
+              if (session.cancelled) {
+                if (!isAutonomousResult) {
+                  await clearFailuresFromEarlierTurns();
+                  stopReason = "cancelled";
+                }
+                break;
               }
 
               // A held turn (see Turn.deferredSettle) settles at its
