@@ -25,6 +25,41 @@ export function toAccountingModelUsage(usage: SdkModelUsage): ModelUsage {
   };
 }
 
+/** Carry billed usage across a private Query replacement in the same ACP session. */
+export function addAccountingUsage(
+  offset: Record<string, ModelUsage> = {},
+  current: Record<string, ModelUsage>,
+): Record<string, ModelUsage> {
+  const result = Object.fromEntries(
+    Object.entries(offset).map(([model, row]) => [model, { ...row }]),
+  );
+  for (const [model, row] of Object.entries(current)) {
+    const old = offset[model];
+    if (!old) {
+      result[model] = { ...row };
+      continue;
+    }
+    const combined = { ...row };
+    for (const key of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadInputTokens",
+      "cacheCreationInputTokens",
+      "reasoningOutputTokens",
+      "webSearchRequests",
+    ] as const) {
+      if (old[key] !== undefined || row[key] !== undefined) {
+        combined[key] = (old[key] ?? 0) + (row[key] ?? 0);
+      }
+    }
+    if (old.costUSD !== undefined && row.costUSD !== undefined) {
+      combined.costUSD = old.costUSD + row.costUSD;
+    } else delete combined.costUSD;
+    result[model] = combined;
+  }
+  return result;
+}
+
 /** Differences SDK query snapshots, including subagents. A decreasing counter
  * indicates an unknown/reset baseline, not a negative bill or a new full turn. */
 export function accountingDelta(

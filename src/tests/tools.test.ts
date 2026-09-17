@@ -18,6 +18,8 @@ import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
   createTaskHook,
+  clearHookCallbacks,
+  registerHookCallback,
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
@@ -28,6 +30,32 @@ import {
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
+
+describe("PostToolUse callback ownership", () => {
+  it("clears only callbacks owned by the cancelled session", async () => {
+    const first = vi.fn(async () => {});
+    const second = vi.fn(async () => {});
+    registerHookCallback("owned-first", { onPostToolUseHook: first }, "session-one");
+    registerHookCallback("owned-second", { onPostToolUseHook: second }, "session-two");
+
+    clearHookCallbacks("session-one");
+    const hook = createPostToolUseHook();
+    const context = { signal: new AbortController().signal };
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-first",
+      context,
+    );
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-second",
+      context,
+    );
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledOnce();
+  });
+});
 
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AcpClient;
@@ -939,6 +967,7 @@ describe("Bash terminal output", () => {
       // terminal_info and terminal_output should NOT be on the exit notification
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_info");
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_output");
+      expect(exitUpdate).not.toHaveProperty("rawOutput");
     });
 
     it("should not include terminal _meta when client does not declare terminal_output support", () => {
@@ -961,6 +990,7 @@ describe("Bash terminal output", () => {
       expect((update as any)._meta).not.toHaveProperty("terminal_info");
       expect((update as any)._meta).not.toHaveProperty("terminal_output");
       expect((update as any)._meta).not.toHaveProperty("terminal_exit");
+      expect(update).toHaveProperty("rawOutput", bashResult);
     });
 
     it("should not include terminal _meta when _meta.terminal_output is false", () => {
@@ -1114,6 +1144,7 @@ describe("Bash terminal output", () => {
         toolUseCache,
         mockClientWithUpdate,
         mockLogger,
+        { parentToolUseId: "parent-agent-tool" },
       );
 
       // Fire PostToolUse hook with a structuredPatch in tool_response
@@ -1153,12 +1184,16 @@ describe("Bash terminal output", () => {
       expect(hookUpdates).toHaveLength(1);
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate._meta.claudeCode.toolName).toBe("Edit");
+      expect(hookUpdate._meta.claudeCode.parentToolUseId).toBe("parent-agent-tool");
       expect(hookUpdate.content).toEqual([
         {
           type: "diff",
           path: "/Users/test/project/file.ts",
           oldText: "context before\nold text\ncontext after",
           newText: "context before\nnew text\ncontext after",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
         },
       ]);
       expect(hookUpdate.locations).toEqual([{ path: "/Users/test/project/file.ts", line: 5 }]);
@@ -1240,8 +1275,24 @@ describe("Bash terminal output", () => {
       expect(hookUpdates).toHaveLength(1);
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate.content).toEqual([
-        { type: "diff", path: "/Users/test/project/file.ts", oldText: "foo", newText: "bar" },
-        { type: "diff", path: "/Users/test/project/file.ts", oldText: "foo", newText: "bar" },
+        {
+          type: "diff",
+          path: "/Users/test/project/file.ts",
+          oldText: "foo",
+          newText: "bar",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
+        },
+        {
+          type: "diff",
+          path: "/Users/test/project/file.ts",
+          oldText: "foo",
+          newText: "bar",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
+        },
       ]);
       expect(hookUpdate.locations).toEqual([
         { path: "/Users/test/project/file.ts", line: 3 },
@@ -1405,6 +1456,9 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/file.ts",
           oldText: "line1\nold line2\nline3",
           newText: "line1\nNEW line2\nline3",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
         },
       ]);
       expect(hookUpdate.locations).toEqual([{ path: "/Users/test/project/file.ts", line: 1 }]);
@@ -1479,6 +1533,9 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/new.ts",
           oldText: null,
           newText: "first\nsecond",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 2, removed: 0 } } },
+          },
         },
       ]);
     });
@@ -1683,7 +1740,7 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     const info = toolInfoFromToolUse(toolUse, false);
 
     expect(info.kind).toBe("switch_mode");
-    expect(info.title).toBe("Ready to code?");
+    expect(info.title).toBe("Approve Plan");
     expect(info.content).toHaveLength(1);
     expect(info.content![0]).toEqual({
       type: "content",
@@ -1730,6 +1787,16 @@ describe("toolInfoFromToolUse - undefined input regression", () => {
     const toolUse = { name: "WebSearch", id: "toolu_ws_undef", input: undefined };
     const info = toolInfoFromToolUse(toolUse, false);
     expect(info.title).toBe("Web search");
+  });
+
+  it("shows a WebSearch query in the tool title", () => {
+    const toolUse = {
+      name: "WebSearch",
+      id: "toolu_ws_query",
+      input: { query: "Agent Client Protocol ACP specification subagents v2" },
+    };
+    const info = toolInfoFromToolUse(toolUse, false);
+    expect(info.title).toBe('Search "Agent Client Protocol ACP specification subagents v2"');
   });
 
   it("TodoWrite with undefined input should not throw", () => {
@@ -2050,16 +2117,29 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
   it("parses the human-readable TaskList format used in session history", () => {
     expect(
       parseTaskListOutput(
-        "#1 [in_progress] Run tests\n#2 [pending] Write release notes [blocked by #1]",
+        "#1 [in_progress] Run tests (runner)\n#2 [pending] Write release notes [blocked by #1, #3]",
       ),
     ).toEqual({
       tasks: [
-        { id: "1", subject: "Run tests", status: "in_progress", blockedBy: [] },
-        { id: "2", subject: "Write release notes", status: "pending", blockedBy: ["1"] },
+        { id: "1", subject: "Run tests", status: "in_progress", owner: "runner", blockedBy: [] },
+        {
+          id: "2",
+          subject: "Write release notes",
+          status: "pending",
+          blockedBy: ["1", "3"],
+        },
       ],
     });
 
     expect(parseTaskListOutput("No tasks found")).toEqual({ tasks: [] });
+  });
+
+  it("handles adversarial TaskList output in linear time", () => {
+    const subject = `${"work [blocked by #1, ".repeat(20000)}work`;
+
+    expect(parseTaskListOutput(`#1 [pending] ${subject}`)).toEqual({
+      tasks: [{ id: "1", subject, status: "pending", blockedBy: [] }],
+    });
   });
 });
 
@@ -2554,6 +2634,71 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     });
   });
 
+  const PARTIAL_NOTE =
+    "NOTE: this agent stopped at its 30-turn limit before finishing. The text below is PARTIAL output; treat it as incomplete. Send the agent a message (SendMessage) to let it continue from where it stopped.";
+  const PARTIAL_LABEL = "[Agent stopped at its turn limit — the output below is partial]";
+
+  it("replaces the maxTurns partial-output note in the structured lane", () => {
+    // A maxTurns-stopped subagent still ships status "completed", with a
+    // model-directed note block leading the report — the SendMessage
+    // instruction is meaningless over ACP, but the partial-output fact isn't.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        { type: "text", text: PARTIAL_NOTE },
+        { type: "text", text: "The partial report." },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+      { type: "content", content: { type: "text", text: "The partial report." } },
+    ]);
+  });
+
+  it("replaces the note variant for an agent that produced no report", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        {
+          type: "text",
+          text: "NOTE: this agent stopped at its 5-turn limit before finishing. It was still calling tools and had produced no report.",
+        },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+    ]);
+  });
+
+  it("replaces the note paragraph in the raw fallback and still strips the trailer", () => {
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [{ type: "text", text: `${PARTIAL_NOTE}\n\nThe report.${TRAILER}` }],
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: `${PARTIAL_LABEL}\n\nThe report.` } },
+    ]);
+  });
+
+  it("leaves a report that merely mentions the note text mid-block alone", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [{ type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` }],
+    });
+
+    expect(update.content).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` },
+      },
+    ]);
+  });
+
   it("strips the trailer from the raw fallback when tool_use_result is absent", () => {
     // Replayed sessions and older CLIs have no structured report; the
     // tail-anchored strip is the only cleanup available there.
@@ -2733,6 +2878,62 @@ describe("tool_result_meta non-execution stamping", () => {
     is_error: true,
     content: "The user doesn't want to proceed with this tool use.",
   };
+
+  it("removes Claude's outer fence from a rejected ExitPlanMode explanation only", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_plan: {
+        type: "tool_use",
+        id: "toolu_plan",
+        name: "ExitPlanMode",
+        input: { plan: "Implement it" },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          is_error: true,
+          content: "```\nThe user chose to keep planning.\n```",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_plan",
+      status: "failed",
+      rawOutput: "The user chose to keep planning.",
+    });
+  });
+
+  it("preserves fenced output from tools other than ExitPlanMode", () => {
+    const fenced = "```text\ncommand output\n```";
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash",
+          content: fenced,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_bash: bashToolUse },
+      mockClient,
+      mockLogger,
+    );
+
+    expect(notifications[0].update).toMatchObject({ rawOutput: fenced });
+  });
 
   it("stamps nonExecutionKind and userFeedback on the failed tool_call_update", () => {
     const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
@@ -3254,6 +3455,50 @@ describe("Skill tool rendering", () => {
       const meta = (notifications[0]?.update as any)?._meta?.claudeCode;
       expect(meta).toBeDefined();
       expect(meta.skill).toBeUndefined();
+    });
+  });
+
+  // ACP tool-call-name RFD: the initial tool_call carries the programmatic
+  // tool name as the standard `name` field, alongside `_meta.claudeCode.toolName`.
+  describe("standard `name` on tool_call notifications", () => {
+    it.each([
+      ["Read", { file_path: "/tmp/a.ts" }],
+      ["Bash", { command: "ls" }],
+      ["mcp__github__list_issues", { repo: "acp" }],
+    ])("reports %s as `name` on the initial tool_call", (name, input) => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_name", name, input }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_name",
+        name,
+        _meta: { claudeCode: { toolName: name } },
+      });
+    });
+
+    it("does not re-send `name` on the refining tool_call_update", () => {
+      const notifications = toAcpNotifications(
+        [
+          { type: "tool_use", id: "toolu_refine", name: "Read", input: { file_path: "/tmp/a" } },
+        ] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+        { emittedToolCalls: new Set(["toolu_refine"]) },
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_refine",
+      });
+      expect((notifications[0]?.update as any).name).toBeUndefined();
     });
   });
 
