@@ -5270,7 +5270,19 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
-                await settleDeferredIfDrained();
+                // CLI 2.1.274+ answers background-task completions that were
+                // already queued with ONE model call: every queued
+                // notification still gets its own result, but all except the
+                // last are placeholders — `num_turns: 0`, empty text, emitted
+                // BEFORE the shared followup runs. A placeholder is not the
+                // summary the hold waits for: settling on it would release
+                // session/prompt with the promised text still ahead, the
+                // out-of-turn delivery issues #864–#866 fixed. Hold through
+                // it; the real followup result (num_turns ≥ 1) or the drain
+                // idle settles the turn.
+                if (message.num_turns > 0) {
+                  await settleDeferredIfDrained();
+                }
                 // With no turn in flight OR QUEUED (also after the settle
                 // above), the stretch holds only autonomous prose — close
                 // it, so a replayed next prompt isn't silently suppressed by
@@ -7285,6 +7297,7 @@ export class ClaudeAcpAgent {
         description,
         defaultToNo,
         suppressAlwaysAllowRule,
+        mcpServer,
       },
     ) => {
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
@@ -7375,10 +7388,20 @@ export class ClaudeAcpAgent {
         defaultToNo,
       });
 
+      // `mcpServer` (SDK 0.3.274+): which MCP server serves an `mcp__*` tool
+      // and where its definition came from. Forwarded verbatim so a client
+      // can key trust on `source` (`sdk` = a host-registered in-process
+      // server; anything else is configuration) instead of parsing the
+      // tool-name prefix. The name is the config key as authored — untrusted
+      // text, so it rides `_meta` rather than the title.
       presentation.toolCall._meta = {
         ...presentation.toolCall._meta,
         lody: { toolName },
-        claudeCode: { toolName, ...(parentToolUseId ? { parentToolUseId } : {}) },
+        claudeCode: {
+          toolName,
+          ...(parentToolUseId ? { parentToolUseId } : {}),
+          ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
+        },
       };
 
       const permissionOptions = buildClaudePermissionOptions({
@@ -9578,10 +9601,10 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
-/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
- *  are kept out of ACP's standard `title`, which clients may use as the shell
- *  command preview, while still giving clients access to Claude's concise
- *  human-readable title. */
+/** Build the Claude Code-specific metadata for a tool call. Shell (Bash and
+ *  PowerShell) descriptions are kept out of ACP's standard `title`, which
+ *  clients may use as the shell command preview, while still giving clients
+ *  access to Claude's concise human-readable title. */
 function claudeCodeMetaFromToolUse(
   toolUse: {
     name: string;
@@ -9590,7 +9613,7 @@ function claudeCodeMetaFromToolUse(
   cwd?: string,
 ): NonNullable<ToolUpdateMeta["claudeCode"]> {
   const description =
-    toolUse.name === "Bash" &&
+    (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
     toolUse.input !== null &&
     typeof toolUse.input === "object" &&
     "description" in toolUse.input &&
@@ -9710,8 +9733,8 @@ function toolMetaFromToolUse(
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
  *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
- *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
- *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
+ *  drift. The initial `tool_call` carries `status: "pending"` and, for shell tools,
+ *  the `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
  *  updates key off of, and the programmatic tool `name` (ACP's tool-call-name
  *  RFD); a refining `tool_call_update` carries none of these. `name` is set
  *  once at first report — on a v1 update, omitting it means "unchanged", and
@@ -9735,7 +9758,7 @@ function toolCallNotification(
   return {
     _meta: {
       ...toolMetaFromToolUse(toolUse, cwd),
-      ...(toolUse.name === "Bash" && supportsTerminalOutput
+      ...((toolUse.name === "Bash" || toolUse.name === "PowerShell") && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
     } satisfies ToolUpdateMeta,
