@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { CreateElicitationResponse } from "@agentclientprotocol/sdk";
 import type {
   CreateElicitationRequest,
+  ClientCapabilities,
   ElicitationAcceptAction,
   ElicitationPropertySchema,
   ElicitationSchema,
@@ -145,6 +146,16 @@ const lodyElicitationMeta = (meta: Omit<LodyElicitationMeta, "version">) => ({
   lody: { elicitation: { version: 1 as const, ...meta } },
 });
 
+export function clientSupportsAnswerNotes(capabilities?: ClientCapabilities | null): boolean {
+  const lody = capabilities?._meta?.lody as
+    { elicitation?: { version?: unknown; answerNotes?: unknown } } | undefined;
+  return (
+    !!capabilities?.elicitation?.form &&
+    lody?.elicitation?.version === 1 &&
+    lody.elicitation.answerNotes === true
+  );
+}
+
 /**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
  *
@@ -157,14 +168,16 @@ const lodyElicitationMeta = (meta: Omit<LodyElicitationMeta, "version">) => ({
  *
  * Each question is followed by its own optional free-text "custom answer" field
  * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
- * user can type their own answer instead of picking an option, scoped to that
- * specific question. Nothing is marked required, so the user can also just skip
- * — matching the built-in tool, which always offers Skip + a free-text box.
+ * user can type their own answer instead of picking an option. Clients that
+ * negotiate Core answerNotes also get a separate additive note field. Nothing is
+ * marked required, so the user can also just skip — matching the built-in tool,
+ * which always offers Skip + a free-text box.
  */
 export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
   sessionId: string,
   toolCallId: string | undefined,
+  answerNotes = false,
 ): CreateElicitationRequest {
   const single = questions.length === 1;
   const properties: Record<string, ElicitationPropertySchema> = {};
@@ -203,6 +216,14 @@ export function askUserQuestionsToCreateRequest(
       description: "Type your own answer instead of choosing an option above (optional).",
       _meta: lodyElicitationMeta({ customAnswerFor: questionFieldKey(index) }),
     };
+    if (answerNotes) {
+      properties[`question_${index}_note`] = {
+        type: "string",
+        title: "Note",
+        description: "Add a note without replacing your answer (optional).",
+        _meta: lodyElicitationMeta({ noteFor: questionFieldKey(index) }),
+      };
+    }
   });
 
   const requestedSchema: ElicitationSchema = {
@@ -226,21 +247,37 @@ export type AskUserQuestionOutcome =
   { action: "answered"; updatedInput: Record<string, unknown> } | { action: "cancel" };
 
 /**
+ * Serialize a multi-select answer the way the CLI's own AskUserQuestion UI
+ * does: comma-joined, with any item that itself contains the separator (or a
+ * double quote) JSON-quoted. The tool's `call()` splits the string back on the
+ * same rule, so a free-text answer like `Redis, not Memcached` stays one item
+ * instead of reading as two more picks.
+ */
+function joinMultiSelectAnswer(items: string[]): string {
+  return items
+    .map((item) => (item.includes(", ") || item.includes('"') ? JSON.stringify(item) : item))
+    .join(", ");
+}
+
+/**
  * Fold an ACP elicitation response into the AskUserQuestion tool's input.
  *
  * Selected labels are read back from the indexed form fields and written into
- * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
- * — the key shape the tool's own `call()` reads. A non-empty per-question
- * custom-answer field (`question_<n>_custom`) takes precedence over that
- * question's selection, since the user typed their own answer instead of
- * picking one. Decline yields empty answers (the model is told the user skipped
- * rather than the turn aborting); cancel — and any custom/future action we
- * don't understand — aborts the tool call.
+ * `answers` as a `{ [questionText]: label }` map — the key shape the tool's own
+ * `call()` reads — with multi-selects comma-joined in the CLI's own quoted form
+ * (see `joinMultiSelectAnswer`). A non-empty custom-answer field replaces the
+ * selection for either question kind, preserving Core customAnswerFor semantics.
+ * Negotiated `question_<n>_note` fields independently populate the SDK's
+ * `annotations[question].notes`; they never replace the answer.
+ * Decline yields empty answers (the model
+ * is told the user skipped rather than the turn aborting); cancel — and any
+ * custom/future action we don't understand — aborts the tool call.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
   toolInput: Record<string, unknown>,
   questions: AskUserQuestion[],
+  answerNotes = false,
 ): AskUserQuestionOutcome {
   if (response.action === "decline") {
     return { action: "answered", updatedInput: { ...toolInput, answers: {} } };
@@ -254,27 +291,51 @@ export function applyAskElicitationResponse(
   // Typed against the tool's own output schema so the answer/response shapes
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
+  const annotations: NonNullable<AskUserQuestionInput["annotations"]> = {};
   questions.forEach((question, index) => {
-    // A typed custom answer wins over the selection: the user chose to write
-    // their own answer for this question instead of picking an option.
     const custom = content[questionCustomFieldKey(index)];
-    if (typeof custom === "string" && custom.trim() !== "") {
-      answers[question.question] = custom.trim();
+    const customText = typeof custom === "string" ? custom.trim() : "";
+    const note = answerNotes ? content[`question_${index}_note`] : undefined;
+    if (typeof note === "string" && note.trim()) {
+      annotations[question.question] = { notes: note.trim() };
+    }
+    // Core customAnswerFor replaces the selection. Additive notes use their
+    // own negotiated field rather than changing the legacy "Other" contract.
+    if (customText) {
+      answers[question.question] = customText;
       return;
     }
 
     const value = content[questionFieldKey(index)];
-    if (value === undefined || value === null) {
+    const picks: string[] =
+      value === undefined || value === null
+        ? []
+        : Array.isArray(value)
+          ? value.filter((item) => item !== undefined && item !== null && item !== "").map(String)
+          : [String(value)];
+
+    // Preserve the CLI's quoting when serializing multiple selected labels.
+    if (question.multiSelect) {
+      const text = joinMultiSelectAnswer(picks);
+      if (text !== "") {
+        answers[question.question] = text;
+      }
       return;
     }
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
-    if (text === "") {
-      return;
-    }
-    answers[question.question] = text;
+
+    // Single-select normally has one label; retain compatibility with arrays.
+    const picked = picks.join(", ");
+    if (picked !== "") answers[question.question] = picked;
   });
 
-  return { action: "answered", updatedInput: { ...toolInput, answers } };
+  return {
+    action: "answered",
+    updatedInput: {
+      ...toolInput,
+      answers,
+      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+    },
+  };
 }
 
 /**

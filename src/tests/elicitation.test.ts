@@ -8,6 +8,7 @@ import type { ElicitationRequest } from "@anthropic-ai/claude-agent-sdk";
 import {
   applyAskElicitationResponse,
   askUserQuestionsToCreateRequest,
+  clientSupportsAnswerNotes,
   AskUserQuestion,
   createElicitationResponseToElicitResult,
   extractAskUserQuestions,
@@ -170,6 +171,49 @@ describe("extractAskUserQuestions", () => {
 });
 
 describe("askUserQuestionsToCreateRequest", () => {
+  it("only advertises a distinct noteFor field after versioned capability negotiation", () => {
+    const questions = [mkQuestion("Which?", [{ label: "A" }])];
+    const capability = {
+      elicitation: { form: {} },
+      _meta: {
+        lody: {
+          elicitation: { version: 1, answerNotes: true },
+        },
+      },
+    };
+    expect(clientSupportsAnswerNotes(capability)).toBe(true);
+    expect(clientSupportsAnswerNotes()).toBe(false);
+    expect(clientSupportsAnswerNotes({ ...capability, elicitation: undefined })).toBe(false);
+    expect(clientSupportsAnswerNotes({ elicitation: { form: {} } })).toBe(false);
+    expect(
+      clientSupportsAnswerNotes({
+        ...capability,
+        _meta: {
+          lody: {
+            elicitation: { version: 2, answerNotes: true },
+          },
+        },
+      }),
+    ).toBe(false);
+    const legacy = askUserQuestionsToCreateRequest(questions, SESSION_ID, "tool") as Extract<
+      CreateElicitationRequest,
+      { mode: "form" }
+    >;
+    const modern = askUserQuestionsToCreateRequest(questions, SESSION_ID, "tool", true) as Extract<
+      CreateElicitationRequest,
+      { mode: "form" }
+    >;
+    if (legacy.mode !== "form" || modern.mode !== "form") throw new Error("Expected forms");
+    expect(legacy.requestedSchema.properties?.question_0_note).toBeUndefined();
+    expect(modern.requestedSchema.properties?.question_0_note).toMatchObject({
+      type: "string",
+      _meta: { lody: { elicitation: { version: 1, noteFor: "question_0" } } },
+    });
+    expect(modern.requestedSchema.properties?.question_0_custom?._meta).toEqual({
+      lody: { elicitation: { version: 1, customAnswerFor: "question_0" } },
+    });
+    expect(modern.requestedSchema.required).toBeUndefined();
+  });
   it("keys a single-select question by a stable id and carries the prompt in message only", () => {
     const questions = [
       mkQuestion(
@@ -341,7 +385,7 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("folds a per-question custom answer into that question's answer", () => {
+  it("uses a multi-select question's custom answer alone when nothing is selected", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_1_custom: "something else entirely" },
@@ -357,10 +401,10 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("prefers a question's custom answer over its selection", () => {
+  it("uses a single-select question's custom answer alone when nothing is selected", () => {
     const response = {
       action: "accept",
-      content: { question_0: "A", question_0_custom: "  my own take  " },
+      content: { question_0_custom: "  my own take  " },
     } as CreateElicitationResponse;
 
     expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
@@ -369,6 +413,140 @@ describe("applyAskElicitationResponse", () => {
         questions,
         metadata: { source: "test" },
         answers: { "Single?": "my own take" },
+      },
+    });
+  });
+
+  it("keeps a single-select pick and carries its negotiated note as an annotation", () => {
+    const response = {
+      action: "accept",
+      content: { question_0: "A", question_0_note: "  my own take  " },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions, true)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "A" },
+        annotations: { "Single?": { notes: "my own take" } },
+      },
+    });
+  });
+
+  it("preserves Core custom-answer replacement semantics for multi-select", () => {
+    const response = {
+      action: "accept",
+      content: { question_1: ["X", "Y"], question_1_custom: "  Z  " },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": "Z" },
+      },
+    });
+  });
+
+  it("quotes a selected label that contains the separator, as the CLI does", () => {
+    const response = {
+      action: "accept",
+      content: { question_1: ["X", "Use Redis, not Memcached"] },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": 'X, "Use Redis, not Memcached"' },
+      },
+    });
+  });
+
+  it("attaches negotiated notes to both selection kinds without altering answers", () => {
+    const response = {
+      action: "accept" as const,
+      content: {
+        question_0: "A",
+        question_0_note: "single note",
+        question_1: ["X", "Y"],
+        question_1_note: "multi note",
+      },
+    };
+    expect(applyAskElicitationResponse(response, toolInput, questions, true)).toMatchObject({
+      action: "answered",
+      updatedInput: {
+        answers: { "Single?": "A", "Multi?": "X, Y" },
+        annotations: { "Single?": { notes: "single note" }, "Multi?": { notes: "multi note" } },
+      },
+    });
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toMatchObject({
+      action: "answered",
+      updatedInput: { answers: { "Single?": "A", "Multi?": "X, Y" } },
+    });
+    const ignored = applyAskElicitationResponse(response, toolInput, questions);
+    if (ignored.action === "answered") expect(ignored.updatedInput.annotations).toBeUndefined();
+  });
+
+  it("custom answers replace single selections even when notes are supported", () => {
+    for (const supported of [false, true]) {
+      expect(
+        applyAskElicitationResponse(
+          {
+            action: "accept",
+            content: {
+              question_0: "A",
+              question_0_custom: "B",
+              question_0_note: "reason",
+            },
+          },
+          toolInput,
+          questions,
+          supported,
+        ),
+      ).toMatchObject({
+        action: "answered",
+        updatedInput: { answers: { "Single?": "B" } },
+      });
+    }
+  });
+
+  it("keeps the selection when the custom answer is blank", () => {
+    const response = {
+      action: "accept",
+      content: {
+        question_0: "A",
+        question_0_custom: "  ",
+        question_1: ["X"],
+        question_1_custom: " ",
+      },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "A", "Multi?": "X" },
+      },
+    });
+  });
+
+  it("uses the custom answer alone when the multi-select array is empty", () => {
+    const response = {
+      action: "accept",
+      content: { question_1: [], question_1_custom: "Z" },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": "Z" },
       },
     });
   });

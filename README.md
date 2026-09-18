@@ -18,6 +18,8 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Client MCP servers
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/session-failure-extension.md)
+- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/recommended-config-values-extension.md)
+- Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/permission-extension.md)
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
@@ -34,25 +36,32 @@ Usage accounting preserves SDK query-wide model totals (including subagents),
 splits available thinking tokens from output, and emits already-included deltas
 between query snapshots. Guessed prices are omitted, including later cumulative
 totals containing an earlier guess. A decreasing counter has no inferred delta;
-same-ID resume/reset accounting still requires a consumer lifetime/baseline policy.
+clear-context restarts carry earlier billed totals into the new private query.
+Explicit reload/resume still requires a consumer lifetime/baseline policy.
 
 For acknowledged steering, a client attaches a unique `_meta.lody.steer.id` to
 `session/prompt`. The adapter maps only those prompts to
-`SDKUserMessage.priority = "now"`; ordinary prompts keep the SDK's default
+`SDKUserMessage.priority = "now"` (or `later` while a permission/elicitation is
+pending, so its input card is not interrupted); ordinary prompts keep the SDK's default
 `next` behavior. Once the SDK applies the steer, the adapter sends
 `_lody/session/steer_applied { sessionId, steerId }` before forwarding output
 owned by the new prompt.
 
-### Nested subagent transcripts
+AskUserQuestion notes require form elicitation plus
+`clientCapabilities._meta.lody.elicitation = { version: 1, answerNotes: true }`.
+The separate `noteFor` field adds an SDK annotation without replacing a selection;
+`customAnswerFor` retains its replacement semantics for all clients.
 
-ACP 1.2 has no standard subagent tool kind or nested-message relationship. Clients that can render
-nested transcripts can opt in with `clientCapabilities._meta["subagent-transcript"] = true`.
-The agent then forwards subagent text, thinking, and tool calls, relating nested updates to the
-launching Agent/Task call through `_meta.claudeCode.parentToolUseId`. Agent/Task calls are marked
-with `_meta.claudeCode.subagent = true`.
+### Subagent sessions
 
-Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
-the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
+Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
+preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
+`nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
+in its initialize response. The canonical field remains supported and takes precedence once it is
+available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
+tool-call representation and child interactions stay on the root session. Clients that use the
+historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
+the flattened child transcript behavior.
 
 ## Contribution Policy
 

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { accountingDelta, getUsage, toAccountingModelUsage, type UsageApiDeps } from "../usage.js";
+import {
+  accountingDelta,
+  addAccountingUsage,
+  getUsage,
+  toAccountingModelUsage,
+  type UsageApiDeps,
+} from "../usage.js";
 
 const resetAt = "2026-09-07T00:00:00Z";
 const shared = {
@@ -24,6 +30,25 @@ const usage = (response: Awaited<ReturnType<UsageApiDeps["fetchApi"]>>) =>
   });
 
 describe("OAuth usage windows", () => {
+  it("carries billed model totals across private-query resets without double billing", () => {
+    const row = {
+      inputTokens: 100,
+      outputTokens: 40,
+      cacheReadInputTokens: 20,
+      reasoningOutputTokens: 10,
+    };
+    const before = { main: row, previousChild: { ...row, costUSD: 0.4 } };
+    const query = { main: { ...row, inputTokens: 5, costUSD: 0.2 } };
+    const after = addAccountingUsage(before, query);
+    expect(after.main.inputTokens).toBe(105);
+    expect(after.main.reasoningOutputTokens).toBe(20);
+    expect(after.main.costUSD).toBeUndefined();
+    expect(after.previousChild).toEqual(before.previousChild);
+    expect(accountingDelta(after, before)?.usage.inputTokens).toBe(5);
+    expect(addAccountingUsage(before, query)).toEqual(after);
+    expect(before.main.inputTokens).toBe(100);
+    expect(addAccountingUsage({ main: { ...row, costUSD: 0.3 } }, query).main.costUSD).toBe(0.5);
+  });
   it("differences query-wide model usage, keeping unknown cost and resets explicit", () => {
     const row = (inputTokens: number) => ({
       inputTokens,
@@ -66,7 +91,7 @@ describe("OAuth usage windows", () => {
       contextWindow: 200000,
     });
     expect(toAccountingModelUsage({ ...raw, costBasis: "unknown" }).costUSD).toBeUndefined();
-    const { thinkingTokens, ...legacy } = raw;
+    const legacy = { ...raw, thinkingTokens: undefined };
     expect(toAccountingModelUsage(legacy).outputTokens).toBe(100);
     expect(toAccountingModelUsage(legacy).reasoningOutputTokens).toBeUndefined();
   });
