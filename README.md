@@ -44,14 +44,20 @@ Acknowledged steering uses `_lody/session/steer { sessionId, prompt, steerId }`
 steer joins the running turn: the adapter pushes it as an `SDKUserMessage` with
 `priority = "now"` (or `later` while a permission/elicitation is pending, so its
 input card is not interrupted) and answers `injected`. With no running turn, or
-once the running turn has been cancelled, it answers `failed` and the client
-keeps the input. The original `session/prompt` stays open until the steered work
+once the running turn is settling or cancelled, it rejects with JSON-RPC
+`invalid request` (`-32600`): the input was not enqueued. The client requeues the
+same message as an ordinary `session/prompt` after the current prompt finishes.
+This is the shared acknowledged-steer refusal contract: only a proven refusal
+permits automatic retry; `failed`, internal errors, and transport failures remain
+ambiguous and must not be automatically resent. Submission is not application.
+The original `session/prompt` stays open until the steered work
 finishes and returns one response whose usage covers every cycle it ran.
 
 `_lody/session/steer_applied { sessionId, steerId }` is sent when the SDK replays
-the steered message, which is when Claude Code takes it into the turn. So it
-always follows any output still streaming from the interrupted cycle, precedes
-the steered message's own output, and precedes the `session/prompt` response.
+the steered message, which is when Claude Code confirms taking it into the turn.
+Some streamed output may precede this replay; the notification is the logical
+ownership boundary, not a guarantee that no steered output appeared earlier.
+For an applied steer it precedes the `session/prompt` response.
 Output before the notification belongs to the earlier logical turn; output after
 it belongs to the steer. A steer overtaken by `session/cancel` is never
 acknowledged; the client cannot tell whether it ran. File-change reports stay
