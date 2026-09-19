@@ -436,8 +436,8 @@ export const CLAUDE_LODY_CAPABILITIES = {
   forkAtTurn: { version: 1 },
   steering: {
     version: 1,
-    transport: "prompt",
-    upstreamTurn: "handoff",
+    transport: "request",
+    upstreamTurn: "same",
     configPolicy: "apply",
   },
   tasks: { version: 1, background: true },
@@ -631,7 +631,9 @@ export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
   _meta?: SteerMeta | null;
-  /** Internal compatibility path for the Core prompt transport. */
+  /** Lody's correlation id (`_lody/session/steer`). Present means the Lody
+   *  contract: `failed` when no turn is running, and `steer_applied` once the
+   *  SDK takes the message into the turn. */
   steerId?: string;
 };
 
@@ -673,6 +675,17 @@ function parseSteerRequest(params: unknown): SteerRequest {
   };
 }
 
+/** {@link parseSteerRequest} plus the `steerId` that `_lody/session/steer`
+ *  requires. */
+function parseLodySteerRequest(params: unknown): SteerRequest {
+  const request = parseSteerRequest(params);
+  const { steerId } = params as Record<string, unknown>;
+  if (typeof steerId !== "string" || steerId.length === 0) {
+    throw RequestError.invalidParams(undefined, "steer params require a non-empty steerId");
+  }
+  return { sessionId: request.sessionId, prompt: request.prompt, steerId };
+}
+
 function parseRateLimitsGetRequest(params: unknown): RateLimitsGetRequest {
   if (!params || typeof params !== "object" || Array.isArray(params)) {
     throw RequestError.invalidParams(undefined, "rate limit params must be an object");
@@ -699,9 +712,6 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
-  /** Client-generated correlation id echoed only when the SDK actually
-   *  applies this steer to the main-agent command queue. */
-  clientSteerId?: string;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -826,6 +836,11 @@ type Turn = {
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
   steeredSettle?: PromptResponse;
+  /** Lody steer ids of the pending `steeredEchoes`, keyed by SDK uuid. The
+   *  echo is when the CLI takes the message into the turn, so it is where
+   *  `steer_applied` is sent: after the interrupted cycle's output, before the
+   *  steered cycle's, and before the idle that can settle the turn. */
+  steerIds?: Map<string, string>;
   carriedUsage?: AccumulatedUsage;
   /** `carriedUsage`'s per-model counterpart, so a turn that survives a
    *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
@@ -835,19 +850,6 @@ type Turn = {
   /** Settles after the ACP prompt request completes, regardless of outcome. */
   completion?: Promise<void>;
 };
-
-function getClientSteerId(meta: PromptRequest["_meta"]): string | undefined {
-  const lody = meta?.lody;
-  if (typeof lody !== "object" || lody === null) {
-    return undefined;
-  }
-  const steer = (lody as Record<string, unknown>).steer;
-  if (typeof steer !== "object" || steer === null) {
-    return undefined;
-  }
-  const steerId = (steer as Record<string, unknown>).id;
-  return typeof steerId === "string" && steerId.length > 0 ? steerId : undefined;
-}
 
 export type Session = {
   unknownUsageCostModels?: Set<string>;
@@ -2847,13 +2849,6 @@ export class ClaudeAcpAgent {
     }
 
     const userMessage = promptToClaude(params);
-    const clientSteerId = getClientSteerId(params._meta);
-    if (clientSteerId) {
-      // `now` is Claude Code's steering lane: it wakes the main loop while
-      // background agents keep running. Ordinary prompts retain default `next`.
-      userMessage.priority =
-        (session.pendingUserInputCount ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
-    }
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -2879,7 +2874,6 @@ export class ClaudeAcpAgent {
     // consumer is running, and awaits the deferred.
     const turn: Turn = {
       promptUuid,
-      clientSteerId,
       isLocalOnlyCommand,
       ...(isUsageCommand ? { isUsageCommand: true } : {}),
       ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
@@ -3099,9 +3093,9 @@ export class ClaudeAcpAgent {
     const steering = await this.steer({
       sessionId: params.sessionId,
       prompt,
-      steerId: randomUUID(),
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     });
-    if (steering.outcome === "failed") {
+    if (steering.outcome !== "injected") {
       await this.prompt({ sessionId: params.sessionId, prompt });
     }
     return {};
@@ -3201,6 +3195,11 @@ export class ClaudeAcpAgent {
     // and the active-path push below stay in one synchronous section so the
     // turn cannot settle in the gap between deciding to inject and enqueueing.
     const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    // A cancelled turn is still unsettled until its interrupt's idle, but it is
+    // ending: Lody's steer is refused so Lody can run it as a follow-up.
+    const refuseLodySteer =
+      params.steerId !== undefined && session.cancelled && turnInFlight === session.activeTurn;
+    if (refuseLodySteer) return { outcome: "failed" };
     if (!turnInFlight) {
       if (params.steerId !== undefined) return { outcome: "failed" };
       if (params._meta?.steering?.idleBehavior === "promptRequired") {
@@ -3232,6 +3231,9 @@ export class ClaudeAcpAgent {
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
+    if (params.steerId !== undefined) {
+      (turnInFlight.steerIds ??= new Map()).set(steeredUuid, params.steerId);
+    }
     // A turn already held for background subagents has a recorded outcome the
     // steer supersedes: move it into the steer lane so one lane owns settlement.
     // The idle handler re-applies the hold through the subagent gate.
@@ -3575,12 +3577,6 @@ export class ClaudeAcpAgent {
         }
       }
       resetTurnScratch();
-      if (turn.clientSteerId) {
-        await this.client.extNotification(CLAUDE_STEER_APPLIED_METHOD, {
-          sessionId: params.sessionId,
-          steerId: turn.clientSteerId,
-        });
-      }
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -5851,9 +5847,24 @@ export class ClaudeAcpAgent {
                 // A steered message's echo matches no turn (steer() creates
                 // none), but it marks the steered cycle as running — how the idle
                 // lane tells "the answer is still ahead" from "the turn is over"
-                // (see Turn.steeredEchoes).
-                if (isSteering(session.activeTurn)) {
-                  session.activeTurn.steeredEchoes.delete(message.uuid);
+                // (see Turn.steeredEchoes). Looked up across the queue: a steer
+                // can target a turn submitted but not yet activated.
+                const steered = (session.turnQueue ?? []).find(
+                  (t) => !t.settled && t.steeredEchoes?.has(message.uuid),
+                );
+                if (steered) {
+                  steered.steeredEchoes?.delete(message.uuid);
+                  const steerId = steered.steerIds?.get(message.uuid);
+                  steered.steerIds?.delete(message.uuid);
+                  // Not after a cancel: the turn settles "cancelled" and the
+                  // steered message will not run, so Lody must not move the
+                  // turn's remaining output onto it.
+                  if (steerId !== undefined && !session.cancelled) {
+                    await this.client.extNotification(CLAUDE_STEER_APPLIED_METHOD, {
+                      sessionId: params.sessionId,
+                      steerId,
+                    });
+                  }
                 }
                 // Unrelated replay (e.g. the echo of an already-settled turn).
                 break;
@@ -10471,6 +10482,11 @@ export function runAcp(logger?: Logger) {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<SteerRequest, SteerResponse>(
+      LODY_EXTENSION_METHODS.sessionSteer,
+      { parse: parseLodySteerRequest },
+      (ctx) => agent.steer(ctx.params),
     )
     .onRequest<AsyncTaskStopRequest, AsyncTaskStopResponse>(
       ASYNC_TASK_STOP_METHOD,

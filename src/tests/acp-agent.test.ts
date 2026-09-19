@@ -87,6 +87,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     getSessionMessages: vi.fn(actual.getSessionMessages),
   };
 });
+// Every result with an `extNotification` client refreshes rate limits, which
+// reads the real credential store and calls the usage API; keep tests offline.
+vi.mock("../usage.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../usage.js")>()),
+  getUsage: vi.fn(async () => null),
+}));
 import type {
   BetaToolResultBlockParam,
   BetaToolSearchToolResultBlockParam,
@@ -13169,97 +13175,6 @@ describe("post-error recovery", () => {
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
-  it("applies a now-priority steer while the previous turn has a background task", async () => {
-    const events: string[] = [];
-    const submittedMessages: any[] = [];
-    let releaseSteerApplication!: () => void;
-    const steerApplicationReleased = new Promise<void>((resolve) => {
-      releaseSteerApplication = resolve;
-    });
-    const mockClient = {
-      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
-        if (notification.update.sessionUpdate === "agent_message_chunk") {
-          const content = notification.update.content;
-          events.push(`output:${content.type === "text" ? content.text : content.type}`);
-        }
-      }),
-      extNotification: vi.fn(async (method: string, params: Record<string, unknown>) => {
-        if (method !== CLAUDE_STEER_APPLIED_METHOD) return;
-        const steerId = String(params.steerId);
-        events.push(`applied:${steerId}`);
-        if (steerId === "steer-b") {
-          await steerApplicationReleased;
-        }
-      }),
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const first = await iter.next();
-        submittedMessages.push(first.value);
-        yield userEcho(first.value);
-        yield {
-          type: "system",
-          subtype: "task_started",
-          task_id: "task-1",
-          description: "Background review",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        const second = await iter.next();
-        submittedMessages.push(second.value);
-        yield {
-          type: "system",
-          subtype: "local_command_output",
-          content: "before",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield userEcho(second.value);
-        yield {
-          type: "system",
-          subtype: "local_command_output",
-          content: "after",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-        yield {
-          type: "system",
-          subtype: "task_notification",
-          task_id: "task-1",
-          status: "completed",
-          output_file: "/tmp/task-1.txt",
-          summary: "done",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-      return messageGenerator();
-    });
-
-    const first = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "first" }],
-    });
-    const second = agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "second" }],
-      _meta: { lody: { steer: { id: "steer-b" } } },
-    });
-
-    await vi.waitFor(() => expect(events).toContain("applied:steer-b"));
-    expect(submittedMessages[0]?.priority).toBeUndefined();
-    expect(submittedMessages[1]?.priority).toBe("now");
-    expect(events).toEqual(["output:before", "applied:steer-b"]);
-    releaseSteerApplication();
-    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
-    expect(events).toEqual(["output:before", "applied:steer-b", "output:after"]);
-  });
-
   it("does not let a settled turn's lagging idle resolve the next turn early (issue #773 race)", async () => {
     const agent = createMockAgent();
     injectGeneratorSession(agent, (input) => {
@@ -16167,10 +16082,11 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   });
 });
 
-describe("turn steering (_meta.lody.steer)", () => {
+describe("turn steering (_lody/session/steer)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
+      extNotification: async () => {},
     } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
@@ -16257,8 +16173,229 @@ describe("turn steering (_meta.lody.steer)", () => {
           timeline.push(notification.update.content?.text);
         }
       },
+      extNotification: async () => {},
     } as unknown as AcpClient;
   }
+
+  /** Records output chunks as `out:<text>` and steer acknowledgements as
+   *  `applied:<steerId>`, in the order the client observes them. */
+  function steerEventsAgent() {
+    const events: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          events.push(`out:${notification.update.content?.text}`);
+        }
+      },
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        if (method === CLAUDE_STEER_APPLIED_METHOD) {
+          expect(params.sessionId).toBe("test-session");
+          events.push(`applied:${String(params.steerId)}`);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    return { agent, events };
+  }
+
+  /** Starts a prompt that appends `prompt:<stopReason>` to `events` when it
+   *  resolves, so ordering against output and acknowledgements is visible. */
+  function startPrompt(agent: ClaudeAcpAgent, events: string[]) {
+    return agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        events.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+  }
+
+  function lodySteer(agent: ClaudeAcpAgent, steerId: string, text = "also handle X") {
+    return agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text }],
+      steerId,
+    });
+  }
+
+  it("acknowledges a steer at its echo: after the interrupted output, before the steered output and the prompt response", async () => {
+    const { agent, events } = steerEventsAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("before");
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        yield createAssistantText("after");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = startPrompt(agent, events);
+    await waitFor(() => events.includes("out:before"));
+    await expect(lodySteer(agent, "steer-1")).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    expect(events).toEqual(["out:before", "applied:steer-1", "out:after", "prompt:end_turn"]);
+    // One ACP prompt spans both cycles, so its usage covers both.
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
+  it("acknowledges consecutive steers in order, each before its own output", async () => {
+    const { agent, events } = steerEventsAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("a");
+        const first = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(first.value);
+        yield createAssistantText("b");
+        const second = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(second.value);
+        yield createAssistantText("c");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = startPrompt(agent, events);
+    await waitFor(() => events.includes("out:a"));
+    await expect(lodySteer(agent, "steer-1")).resolves.toEqual({ outcome: "injected" });
+    await waitFor(() => events.includes("out:b"));
+    await expect(lodySteer(agent, "steer-2")).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    expect(events).toEqual([
+      "out:a",
+      "applied:steer-1",
+      "out:b",
+      "applied:steer-2",
+      "out:c",
+      "prompt:end_turn",
+    ]);
+    expect(response.usage?.inputTokens).toBe(30);
+  });
+
+  it("does not acknowledge a steer the cancel pre-empted, and refuses steers after cancel", async () => {
+    const { agent, events } = steerEventsAgent();
+    let releaseAfterCancel = () => {};
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working");
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        await afterCancel;
+        // The CLI may still replay the steered message it had dequeued.
+        yield userEcho(steered.value);
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = startPrompt(agent, events);
+    await waitFor(() => events.includes("out:working"));
+    await expect(lodySteer(agent, "steer-1")).resolves.toEqual({ outcome: "injected" });
+    await waitFor(() => agent.sessions["test-session"]?.activeTurn?.steeredSettle !== undefined);
+
+    await agent.cancel({ sessionId: "test-session" });
+    // The turn is ending: Lody gets an explicit refusal and requeues it.
+    await expect(lodySteer(agent, "steer-late")).resolves.toEqual({ outcome: "failed" });
+    releaseAfterCancel();
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    await agent.sessions["test-session"]?.consumer;
+    expect(events).toEqual(["out:working", "prompt:cancelled"]);
+  });
+
+  it("keeps a turn held for a background subagent open across a steer", async () => {
+    const { agent, events } = steerEventsAgent();
+    const subagentStarted = {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-1",
+      tool_use_id: "toolu_agent-1",
+      description: "Explore the project",
+      subagent_type: "Explore",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+    const taskNotification = {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-1",
+      tool_use_id: "toolu_agent-1",
+      status: "completed",
+      output_file: "",
+      summary: "done",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield { type: "system", subtype: "session_state_changed", state: "running" };
+        yield subagentStarted;
+        yield createResultMessage(); // held: the subagent is still live
+        yield idleMessage();
+        const steered = await iter.next();
+        yield userEcho(steered.value);
+        yield createAssistantText("steered");
+        yield createResultMessage();
+        yield idleMessage(); // still held: the subagent has not finished
+        yield taskNotification;
+        yield createAssistantText("summary");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = startPrompt(agent, events);
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    await expect(lodySteer(agent, "steer-1")).resolves.toEqual({ outcome: "injected" });
+
+    await turn;
+    expect(events).toEqual(["applied:steer-1", "out:steered", "out:summary", "prompt:end_turn"]);
+  });
+
+  it("does not acknowledge the internal steer a goal control uses", async () => {
+    const { agent, events } = steerEventsAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const goal = await iter.next();
+        yield userEcho(goal.value);
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = startPrompt(agent, events);
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.goal({ sessionId: "test-session", action: "clear" });
+
+    await turn;
+    expect(events).toEqual(["prompt:end_turn"]);
+  });
 
   const waitFor = async (cond: () => boolean) => {
     for (let i = 0; i < 200; i++) {
