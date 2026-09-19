@@ -3195,13 +3195,18 @@ export class ClaudeAcpAgent {
     // and the active-path push below stay in one synchronous section so the
     // turn cannot settle in the gap between deciding to inject and enqueueing.
     const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
-    // A cancelled turn is still unsettled until its interrupt's idle, but it is
-    // ending: Lody's steer is refused so Lody can run it as a follow-up.
+    // A settling turn may be awaiting checkpoint reporting; it can no longer
+    // own new input. Refuse before enqueueing so Lody can safely run a normal
+    // follow-up. `failed` is ambiguous to clients, not a non-delivery verdict.
     const refuseLodySteer =
-      params.steerId !== undefined && session.cancelled && turnInFlight === session.activeTurn;
-    if (refuseLodySteer) return { outcome: "failed" };
+      params.steerId !== undefined &&
+      (!turnInFlight ||
+        turnInFlight.settling ||
+        (session.cancelled && turnInFlight === session.activeTurn));
+    if (refuseLodySteer) {
+      throw RequestError.invalidRequest("No active Claude turn accepting steer input");
+    }
     if (!turnInFlight) {
-      if (params.steerId !== undefined) return { outcome: "failed" };
       if (params._meta?.steering?.idleBehavior === "promptRequired") {
         return { outcome: "promptRequired", reason: "noRunningTurn" };
       }

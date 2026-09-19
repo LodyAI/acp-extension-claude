@@ -16217,6 +16217,71 @@ describe("turn steering (_lody/session/steer)", () => {
     });
   }
 
+  it("refuses idle steering as provably undelivered without starting a prompt", async () => {
+    const agent = createMockAgent();
+    agent.sessions["test-session"] = mockSessionState({ input: new Pushable<any>() });
+    const prompt = vi.spyOn(agent, "prompt");
+    const push = vi.spyOn(agent.sessions["test-session"].input, "push");
+    await expect(lodySteer(agent, "idle")).rejects.toMatchObject({ code: -32600 });
+    expect(prompt).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("refuses steering during checkpoint settlement and accepts the same input as a normal follow-up", async () => {
+    const { agent, events } = steerEventsAgent();
+    let releaseReport!: () => void;
+    const reportGate = new Promise<void>((resolve) => {
+      releaseReport = resolve;
+    });
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* stream() {
+          const iter = input[Symbol.asyncIterator]();
+          const original = await iter.next();
+          yield userEcho(original.value);
+          yield createAssistantText("original");
+          yield createResultMessage();
+          yield idleMessage();
+          const followUp = await iter.next();
+          expect(followUp.value.message.content).toEqual([{ type: "text", text: "also handle X" }]);
+          yield userEcho(followUp.value);
+          yield createAssistantText("follow-up");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        return stream();
+      },
+      {
+        fileChangeReporter: {
+          request: () => undefined,
+          capture: async () => {},
+          report: async () => {
+            await reportGate;
+          },
+          finish: () => {},
+        } as any,
+      },
+    );
+    const turn = startPrompt(agent, events);
+    await waitFor(() => !!agent.sessions["test-session"].activeTurn?.settling);
+    const push = vi.spyOn(agent.sessions["test-session"].input, "push");
+    try {
+      await expect(lodySteer(agent, "settlement-race")).rejects.toMatchObject({ code: -32600 });
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      releaseReport();
+    }
+    await turn;
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+    await agent.sessions["test-session"].consumer;
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["out:original", "prompt:end_turn", "out:follow-up"]);
+  });
+
   it("acknowledges a steer at its echo: after the interrupted output, before the steered output and the prompt response", async () => {
     const { agent, events } = steerEventsAgent();
     injectGeneratorSession(agent, (input) => {
@@ -16313,7 +16378,7 @@ describe("turn steering (_lody/session/steer)", () => {
 
     await agent.cancel({ sessionId: "test-session" });
     // The turn is ending: Lody gets an explicit refusal and requeues it.
-    await expect(lodySteer(agent, "steer-late")).resolves.toEqual({ outcome: "failed" });
+    await expect(lodySteer(agent, "steer-late")).rejects.toMatchObject({ code: -32600 });
     releaseAfterCancel();
 
     await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
@@ -16750,7 +16815,7 @@ describe("turn steering (_lody/session/steer)", () => {
     });
   });
 
-  it("returns failed without consuming the prompt when no turn is in flight", async () => {
+  it("rejects without consuming the prompt when no turn is in flight", async () => {
     const agent = createMockAgent();
     const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
     agent.sessions["test-session"] = mockSessionState({
@@ -16764,7 +16829,7 @@ describe("turn steering (_lody/session/steer)", () => {
       steerId: "steer-idle",
     };
 
-    await expect(agent.steer(request)).resolves.toEqual({ outcome: "failed" });
+    await expect(agent.steer(request)).rejects.toMatchObject({ code: -32600 });
     expect(prompt).not.toHaveBeenCalled();
   });
 

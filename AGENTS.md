@@ -30,6 +30,11 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
 ## ACP Turn Forks
 
+- Acknowledged steer is inject-or-refuse. Use JSON-RPC `invalid request`
+  (`-32600`) only for proven non-delivery so Lody can queue the same input as a
+  normal prompt. Never accept correlated steer once a turn is settling. An
+  internal/transport failure is ambiguous and must not authorize automatic retry.
+
 - SDK usage is query-cumulative by model, not top-level per-turn usage. Split
   thinking out of output. Preserve unknown costs across later guessed/known
   snapshots; delta uses the last emitted query baseline and is omitted on a
