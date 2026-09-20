@@ -40,6 +40,9 @@ export type ContextCompactionLifecycleOptions = {
   logError?: (message: string, error: unknown) => void;
 };
 
+/** Why a legacy tool call reports `failed` when the turn ended around it. */
+const ABANDONED_COMPACTION_ERROR = "The turn ended before compaction reported a result";
+
 export function clientSupportsCompactionUpdates(capabilities?: ClientCapabilities | null): boolean {
   const compaction = capabilities?.session?.compaction;
   return typeof compaction === "object" && compaction !== null && !Array.isArray(compaction);
@@ -165,27 +168,40 @@ export class ContextCompactionLifecycle {
   /**
    * Close the lifecycle at a turn boundary (result, cancel, idle-abandon).
    *
-   * A `compaction_update` entity still `in_progress` here never received its
-   * terminal signal from the runtime and gets its one terminal status,
-   * `cancelled`. The legacy tool call is deliberately left as it was (an
-   * `in_progress` call): ACP `ToolCallStatus` has no cancelled state and that
-   * presentation's behavior predates this lifecycle. Never throws — a failed
-   * send is logged, so callers can settle the turn unconditionally.
+   * An entity still `in_progress` here never received its terminal signal from
+   * the runtime, and nothing after the turn boundary can deliver one — so it
+   * gets its one terminal status. `compaction_update` says `cancelled`; the
+   * legacy tool call says `failed`, because ACP `ToolCallStatus` has no
+   * cancelled state and an unsettled tool call renders as a spinner that never
+   * stops. Never throws — a failed send is logged, so callers can settle the
+   * turn unconditionally.
    */
   async reset(): Promise<void> {
     const state = this.activeCompaction;
     this.activeCompaction = undefined;
     this.outputDelivered = false;
     this.duplicateErrorOutput = undefined;
-    if (!state || state.terminalStatus || this.presentation !== "compaction_update") return;
+    if (!state || state.terminalStatus) return;
     state.terminalStatus = "cancelled";
+    if (this.presentation === "compaction_update") {
+      await this.sendQuietly(
+        {
+          sessionUpdate: "compaction_update",
+          compactionId: state.compactionId,
+          status: "cancelled",
+        },
+        "cancelled compaction",
+      );
+      return;
+    }
     await this.sendQuietly(
       {
-        sessionUpdate: "compaction_update",
-        compactionId: state.compactionId,
-        status: "cancelled",
+        sessionUpdate: "tool_call_update",
+        toolCallId: state.compactionId,
+        status: "failed",
+        _meta: compactionToolMeta({ error: ABANDONED_COMPACTION_ERROR }),
       },
-      "cancelled compaction",
+      "abandoned compaction",
     );
   }
 

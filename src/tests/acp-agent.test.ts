@@ -12144,7 +12144,7 @@ describe("assembled assistant text fallback", () => {
         (update) =>
           update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
       );
-    expect(toolUpdates).toHaveLength(2);
+    expect(toolUpdates).toHaveLength(3);
     expect(toolUpdates[0]).toMatchObject({
       sessionUpdate: "tool_call",
       toolCallId: "compact-delta-1",
@@ -12154,6 +12154,13 @@ describe("assembled assistant text fallback", () => {
       sessionUpdate: "tool_call_update",
       toolCallId: "compact-delta-1",
       status: "in_progress",
+    });
+    // The compaction block carries no terminal signal, so the turn boundary
+    // settles the call rather than leaving it spinning forever.
+    expect(toolUpdates[2]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "compact-delta-1",
+      status: "failed",
     });
     expect(JSON.stringify(updates)).not.toContain("internal summary");
   });
