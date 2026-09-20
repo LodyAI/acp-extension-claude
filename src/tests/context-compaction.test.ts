@@ -491,4 +491,67 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
       },
     ]);
   });
+
+  it("settles an abandoned legacy tool call as failed on reset", async () => {
+    // ACP ToolCallStatus has no cancelled state, and a tool call left
+    // `in_progress` renders as a spinner that never stops: the turn boundary
+    // is the last chance to give it a terminal status.
+    const { sent, compaction } = lifecycle("tool_call");
+
+    await compaction.start("compact-open");
+    await compaction.reset();
+
+    expect(sent.at(-1)).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "compact-open",
+      status: "failed",
+      _meta: {
+        contextCompaction: {
+          version: 1,
+          error: "The turn ended before compaction reported a result",
+        },
+        claudeCode: { toolName: "compact" },
+        lody: {
+          activity: {
+            version: 1,
+            kind: "context_compaction",
+            automatic: false,
+            failureReason: "The turn ended before compaction reported a result",
+          },
+        },
+      },
+    });
+    expect(compaction.hasDeliveredOutput).toBe(false);
+  });
+
+  it("leaves a settled legacy tool call alone on reset", async () => {
+    const { sent, compaction } = lifecycle("tool_call");
+
+    await compaction.start("compact-done");
+    await compaction.finish("compact-done", "completed");
+    const before = sent.length;
+
+    await compaction.reset();
+
+    expect(sent).toHaveLength(before);
+  });
+
+  it("keeps one row when the runtime re-announces a compaction already in flight", async () => {
+    // Claude Code repeats `status: "compacting"` while a single compaction
+    // runs. History merges tool calls by id, so minting a fresh id per
+    // announcement stacked n "Compacting context" spinners for one compaction
+    // and left every id but the last without a terminal update.
+    const { sent, compaction } = lifecycle("tool_call");
+
+    await compaction.start("compact-1");
+    await compaction.start("compact-2");
+    await compaction.start("compact-3");
+    await compaction.finish("compact-boundary", "completed");
+
+    expect(sent.map((update) => ("toolCallId" in update ? update.toolCallId : undefined))).toEqual([
+      "compact-1",
+      "compact-1",
+    ]);
+    expect(sent.at(-1)).toMatchObject({ sessionUpdate: "tool_call_update", status: "completed" });
+  });
 });
