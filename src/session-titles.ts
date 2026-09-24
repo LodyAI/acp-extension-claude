@@ -14,6 +14,7 @@
  * {@link SessionTitles.reset} on `conversation_reset`.
  */
 
+import type { LodySessionMeta } from "acp-extension-core";
 import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
@@ -78,6 +79,7 @@ export class SessionTitles {
   /** Last title pushed to the client via `session_info_update`, so an unchanged
    *  title is never re-notified. Undefined until the first push. */
   private lastTitle?: string;
+  private lastTitleSource?: LodySessionMeta["titleSource"];
 
   /** Rolling tail of this session's own user + assistant text, capped at
    *  {@link MAX_TITLE_CONTEXT_LENGTH}. Dropped once a title exists. */
@@ -127,6 +129,7 @@ export class SessionTitles {
     this.settled = false;
     this.context = undefined;
     this.lastTitle = undefined;
+    this.lastTitleSource = undefined;
   }
 
   /** Start watching for a title that Claude persisted during the active turn.
@@ -166,7 +169,7 @@ export class SessionTitles {
     if (info?.customTitle) {
       this.settled = true;
       this.context = undefined;
-      await this.publish(info.customTitle, info.lastModified);
+      await this.publish(info.customTitle, info.lastModified, "explicit");
       return;
     }
 
@@ -187,7 +190,7 @@ export class SessionTitles {
     // raw first prompt, which must never overwrite a generated title if the
     // persisted one is slow to show up in `info`.
     if (fallback && !this.settled) {
-      await this.publish(fallback.title, fallback.lastModified);
+      await this.publish(fallback.title, fallback.lastModified, "fallback");
     }
   }
 
@@ -204,7 +207,7 @@ export class SessionTitles {
       this.settled = true;
       this.context = undefined;
       this.stopPolling();
-      await this.publish(info.customTitle, info.lastModified);
+      await this.publish(info.customTitle, info.lastModified, "explicit");
     } finally {
       this.lookupInFlight = false;
     }
@@ -230,17 +233,23 @@ export class SessionTitles {
   }
 
   /** Notify the client of a title, unless it is the one we last sent. */
-  private async publish(rawTitle: string, lastModified: number): Promise<void> {
+  private async publish(
+    rawTitle: string,
+    lastModified: number,
+    titleSource: NonNullable<LodySessionMeta["titleSource"]>,
+  ): Promise<void> {
     const title = sanitizeTitle(rawTitle);
-    if (title === this.lastTitle) {
+    if (title === this.lastTitle && titleSource === this.lastTitleSource) {
       return;
     }
     this.lastTitle = title;
+    this.lastTitleSource = titleSource;
     await this.agent.client.sessionUpdate({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "session_info_update",
         title,
+        _meta: { lody: { titleSource } },
         updatedAt: new Date(lastModified).toISOString(),
       },
     });
@@ -292,12 +301,12 @@ export class SessionTitles {
       this.settled = false;
 
       if (fallback) {
-        await this.publish(fallback.title, fallback.lastModified);
+        await this.publish(fallback.title, fallback.lastModified, "fallback");
       }
       return;
     }
 
     this.context = undefined;
-    await this.publish(title, Date.now());
+    await this.publish(title, Date.now(), "generated");
   }
 }

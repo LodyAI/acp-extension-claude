@@ -84,3 +84,12 @@ the flattened child transcript behavior.
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:
 
 > By contributing to this project, you agree that your contributions will be licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0). You affirm that you have the legal right to submit your work, that you are not including code you do not have rights to, and that you understand contributions are made without requiring a Contributor License Agreement (CLA).
+
+## Automatic session titles
+
+The adapter advertises Core `agentCapabilities._meta.lody.sessionTitle: { version: 1 }`.
+It uses the existing ACP `session/update` callback with `session_info_update` and
+`_meta.lody.titleSource`: `generated` for SDK generation, `explicit` for persisted
+custom names (the SDK combines generated names and user renames), and `fallback`
+for prompt summaries. Hosts can skip their own title process while rejecting
+fallback previews. A change of source is published even when the text is unchanged.
