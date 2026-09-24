@@ -6743,6 +6743,7 @@ describe("stop reason propagation", () => {
     expect(titleUpdate?.update).toEqual({
       sessionUpdate: "session_info_update",
       title: "Fix the flaky title test",
+      _meta: { lody: { titleSource: "explicit" } },
       updatedAt: new Date(1_700_000_000_000).toISOString(),
     });
     expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
@@ -8935,6 +8936,7 @@ describe("logout", () => {
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
     expect(response.agentCapabilities?._meta?.lody).toEqual(CLAUDE_LODY_CAPABILITIES);
+    expect(response.agentCapabilities?._meta?.lody).toMatchObject({ sessionTitle: { version: 1 } });
   });
 
   it("advertises the agent subagent capability independently of client negotiation", async () => {
@@ -16519,6 +16521,7 @@ describe("turn steering (_lody/session/steer)", () => {
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?._meta?.lody).toEqual(CLAUDE_LODY_CAPABILITIES);
+    expect(response.agentCapabilities?._meta?.lody).toMatchObject({ sessionTitle: { version: 1 } });
   });
 
   it("submits set and clear through the session prompt queue when the session is idle", async () => {

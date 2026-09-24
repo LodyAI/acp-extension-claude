@@ -431,6 +431,7 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
 export const CLAUDE_STEER_APPLIED_METHOD = LODY_EXTENSION_METHODS.sessionSteerApplied;
 
 export const CLAUDE_LODY_CAPABILITIES = {
+  sessionTitle: { version: 1 },
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
   forkAtTurn: { version: 1 },
