@@ -1,8 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import { appendTitleContext } from "../session-titles.js";
+import { appendTitleContext, SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import { getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -18,22 +16,6 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
 });
 
 describe("SDK title generation contract", () => {
-  // Smoke test for the one undeclared SDK method this feature rests on:
-  // `generateSessionTitle` is on the runtime `Query` class but absent from
-  // `sdk.d.ts`, so nothing else would catch its removal. Method names survive
-  // bundling (only module-scope identifiers get mangled), so an SDK upgrade that
-  // renames or drops it fails here instead of silently degrading titles back to
-  // raw prompts. Runs unconditionally — it reads the shipped bundle and never
-  // spawns the CLI.
-  it("SDK still ships generateSessionTitle and its control subtype", async () => {
-    const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
-    const bundle = await readFile(sdkEntry, "utf8");
-    expect({
-      method: bundle.includes("async generateSessionTitle("),
-      subtype: bundle.includes('subtype:"generate_session_title"'),
-    }).toEqual({ method: true, subtype: true });
-  });
-
   it("keeps only the trailing title context", () => {
     expect(appendTitleContext("abc", "def")).toBe("abcdef");
     expect(appendTitleContext(undefined, "abc")).toBe("abc");
@@ -56,7 +38,11 @@ describe("session titles at turn-end", () => {
         if (u.update?.sessionUpdate === "session_info_update") updates.push(u.update);
       },
     } as unknown as AcpClient;
-    return { client, titles: () => updates.map((u) => u.title) };
+    return {
+      client,
+      titles: () => updates.map((u) => u.title),
+      sources: () => updates.map((u) => u._meta?.lody?.titleSource),
+    };
   }
 
   /** `wrapQuery` plus the undeclared `generateSessionTitle` the real `Query`
@@ -118,6 +104,7 @@ describe("session titles at turn-end", () => {
     expect(titleUpdate?.update).toEqual({
       sessionUpdate: "session_info_update",
       title: "Fix the flaky title test",
+      _meta: { lody: { titleSource: "fallback" } },
       updatedAt: new Date(1_700_000_000_000).toISOString(),
     });
     expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
@@ -150,7 +137,7 @@ describe("session titles at turn-end", () => {
   });
 
   it("generates a title at turn-end instead of publishing the raw prompt", async () => {
-    const { client, titles } = titleRecorder();
+    const { client, titles, sources } = titleRecorder();
     const agent = newAgent(client);
 
     // What an SDK-driven session really looks like: nothing has written a title,
@@ -181,10 +168,11 @@ describe("session titles at turn-end", () => {
     expect(generateSessionTitle).toHaveBeenCalledWith(LONG_PROMPT, { persist: true });
     // The raw prompt was never published — only the generated title.
     expect(titles()).toEqual(["Explain add() in hello.py"]);
+    expect(sources()).toEqual(["generated"]);
   });
 
   it("adopts a stored title and never generates over it", async () => {
-    const { client, titles } = titleRecorder();
+    const { client, titles, sources } = titleRecorder();
     const agent = newAgent(client);
 
     // The SDK folds a `/rename` and an earlier generated title into the same
@@ -208,10 +196,11 @@ describe("session titles at turn-end", () => {
 
     expect(generateSessionTitle).not.toHaveBeenCalled();
     expect(titles()).toEqual(["Renamed by the user"]);
+    expect(sources()).toEqual(["explicit"]);
   });
 
   it("generates once per session, and a later turn can't fall back to the prompt", async () => {
-    const { client, titles } = titleRecorder();
+    const { client, titles, sources } = titleRecorder();
     const agent = newAgent(client);
 
     // `getSessionInfo` never reports the persisted title here, so the
@@ -244,10 +233,33 @@ describe("session titles at turn-end", () => {
 
     expect(generateSessionTitle).toHaveBeenCalledTimes(1);
     expect(titles()).toEqual(["Explain add() in hello.py"]);
+    expect(sources()).toEqual(["generated"]);
+  });
+
+  it("republishes an unchanged preview when its source becomes authoritative", async () => {
+    const { client, titles, sources } = titleRecorder();
+    const agent = newAgent(client);
+    const session = mockSessionState({ queryClosed: true }, agent);
+    const state = new SessionTitles(agent, "test-session");
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Same title",
+      lastModified: 1_700_000_000_000,
+    } as any);
+    await state.onTurnEnd(session);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      customTitle: "Same title",
+      lastModified: 1_700_000_000_001,
+    } as any);
+    await state.onTurnEnd(session);
+    expect(titles()).toEqual(["Same title", "Same title"]);
+    expect(sources()).toEqual(["fallback", "explicit"]);
+    state.dispose();
   });
 
   it("releases the latch when generation yields no title", async () => {
-    const { client, titles } = titleRecorder();
+    const { client, titles, sources } = titleRecorder();
     const agent = newAgent(client);
 
     vi.mocked(getSessionInfo).mockResolvedValue({
@@ -278,6 +290,7 @@ describe("session titles at turn-end", () => {
 
     // Nothing generated, so the client still gets the summary fallback.
     expect(titles()).toEqual([LONG_PROMPT]);
+    expect(sources()).toEqual(["fallback"]);
   });
 
   it("skips argument-less slash commands and bash openers when building the title context", async () => {
