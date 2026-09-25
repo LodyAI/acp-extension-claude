@@ -34,13 +34,16 @@ on their standard protocol paths.
 
 Usage accounting reads SDK query-wide model totals (including subagents) and
 splits available thinking tokens from output. Each SDK result is its own Core
-usage scope (`_meta.lody.usageScopeId` = result uuid) whose `modelUsage` holds
-only what that result added to the query-wide reading; results that added
-nothing emit no update. A counter below the previous reading marks a new
-query() from zero, so the whole reading is new work. Nothing carries across
-clear-context restarts, reloads or process restarts: new results bring new
-scopes, so a consumer never compares them with an older, larger total. Guessed
-prices are omitted for the rest of the query that contained the guess.
+usage scope (`_meta.lody.usageScopeId` = result uuid) whose `modelUsage` and
+`delta` hold only what that result added to the query-wide reading; results that
+added nothing emit no update. A resumed query() (plain resume or resume +
+forkSession) continues the running total Claude Code saved in the `resume`
+transcript's last `cost-state` record, so that record seeds the reading and
+history is never billed again; `forkSession()` copies and fresh sessions start
+from zero. The baseline is read off the load path and applied before the first
+result; if the transcript cannot be read, the first result only anchors.
+Zeroed crash results do not reset the reading. Guessed prices are omitted for
+the rest of the query that contained the guess.
 
 Acknowledged steering uses `_lody/session/steer { sessionId, prompt, steerId }`
 (`transport: "request"`, `upstreamTurn: "same"`, `configPolicy: "apply"`). The

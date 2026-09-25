@@ -20040,7 +20040,7 @@ describe("usage accounting scopes", () => {
     maxOutputTokens: 32000,
   });
 
-  function result(uuid: string, modelUsage: Record<string, ReturnType<typeof sdkRow>>) {
+  function result(uuid: string, modelUsage: Record<string, Record<string, number>>) {
     return {
       type: "result",
       subtype: "success",
@@ -20065,7 +20065,7 @@ describe("usage accounting scopes", () => {
     };
   }
 
-  function setup(results: ReturnType<typeof result>[]) {
+  function setup(results: ReturnType<typeof result>[], overrides: Record<string, any> = {}) {
     const usageUpdates: any[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -20076,15 +20076,19 @@ describe("usage accounting scopes", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    injectGeneratorSession(agent, async function* (input) {
-      const iter = input[Symbol.asyncIterator]();
-      for (const next of results) {
-        const { value } = await iter.next();
-        yield userEcho(value);
-        yield next;
-        yield idleMessage();
-      }
-    });
+    injectGeneratorSession(
+      agent,
+      async function* (input) {
+        const iter = input[Symbol.asyncIterator]();
+        for (const next of results) {
+          const { value } = await iter.next();
+          yield userEcho(value);
+          yield next;
+          yield idleMessage();
+        }
+      },
+      overrides,
+    );
     const prompt = () =>
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
     return { usageUpdates, prompt };
@@ -20124,6 +20128,67 @@ describe("usage accounting scopes", () => {
     expect(after.usageUpdates).toHaveLength(1);
     expect(after.usageUpdates[0]._meta.lody.usageScopeId).toBe("result-2");
     expect(after.usageUpdates[0].modelUsage.main).toMatchObject({ inputTokens: 40 });
+  });
+
+  it("counts only new work after a resume restores the saved running total", async () => {
+    // Claude Code seeds a resumed query() from the transcript's last cost-state,
+    // so its first result already carries every earlier turn.
+    const restored = {
+      "claude-haiku": {
+        inputTokens: 919,
+        outputTokens: 100,
+        thinkingTokens: 72,
+        cacheReadInputTokens: 15176,
+        cacheCreationInputTokens: 16129,
+        webSearchRequests: 0,
+        costUSD: 0.035,
+      },
+    };
+    const row = (inputTokens: number, outputTokens: number, cacheRead: number, cost: number) => ({
+      ...sdkRow(inputTokens, cost),
+      outputTokens,
+      thinkingTokens: 108,
+      cacheReadInputTokens: cacheRead,
+      cacheCreationInputTokens: 16678,
+    });
+    const { usageUpdates, prompt } = setup(
+      [result("resumed-1", { "claude-haiku": row(929, 143, 31305, 0.038) })],
+      {
+        pendingUsageBaseline: Promise.resolve({
+          known: true,
+          modelUsage: restored,
+          hasUnknownModelCost: false,
+        }),
+      },
+    );
+    await prompt();
+
+    expect(usageUpdates).toHaveLength(1);
+    expect(usageUpdates[0].modelUsage["claude-haiku"]).toMatchObject({
+      inputTokens: 10,
+      cacheReadInputTokens: 16129,
+      cacheCreationInputTokens: 549,
+    });
+    expect(usageUpdates[0].modelUsage["claude-haiku"].costUSD).toBeCloseTo(0.003);
+  });
+
+  it("anchors on the first result when the restored total is unknown", async () => {
+    const { usageUpdates, prompt } = setup(
+      [
+        result("history-included", { main: sdkRow(5000, 5) }),
+        result("zeroed", {}),
+        result("next", { main: sdkRow(5040, 5.04) }),
+      ],
+      { pendingUsageBaseline: Promise.resolve({ known: false }) },
+    );
+    await prompt();
+    await prompt();
+    await prompt();
+
+    // The first reading may be mostly history, and a zeroed crash result must
+    // not reset the reading: only the last result's own work is reported.
+    expect(usageUpdates.map((u) => u._meta.lody.usageScopeId)).toEqual(["next"]);
+    expect(usageUpdates[0].modelUsage.main).toMatchObject({ inputTokens: 40 });
   });
 
   it("emits nothing for a result that added no usage", async () => {
