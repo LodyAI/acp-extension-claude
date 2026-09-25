@@ -32,12 +32,18 @@ acknowledged steering, goals, subagent/background-task lifecycle, and compaction
 ACP-standard elicitation, plans, session forking, and context-window usage remain
 on their standard protocol paths.
 
-Usage accounting preserves SDK query-wide model totals (including subagents),
-splits available thinking tokens from output, and emits already-included deltas
-between query snapshots. Guessed prices are omitted, including later cumulative
-totals containing an earlier guess. A decreasing counter has no inferred delta;
-clear-context restarts carry earlier billed totals into the new private query.
-Explicit reload/resume still requires a consumer lifetime/baseline policy.
+Usage accounting reads SDK query-wide model totals (including subagents) and
+splits available thinking tokens from output. Each SDK result is its own Core
+usage scope (`_meta.lody.usageScopeId` = result uuid) whose `modelUsage` and
+`delta` hold only what that result added to the query-wide reading; results that
+added nothing emit no update. A resumed query() (plain resume or resume +
+forkSession) continues the running total Claude Code saved in the `resume`
+transcript's last `cost-state` record, so that record seeds the reading and
+history is never billed again; `forkSession()` copies and fresh sessions start
+from zero. The baseline is read off the load path and applied before the first
+result; if the transcript cannot be read, the first result only anchors.
+Zeroed crash results do not reset the reading. Guessed prices are omitted for
+the rest of the query that contained the guess.
 
 Acknowledged steering uses `_lody/session/steer { sessionId, prompt, steerId }`
 (`transport: "request"`, `upstreamTurn: "same"`, `configPolicy: "apply"`). The

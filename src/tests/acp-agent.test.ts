@@ -17368,7 +17368,7 @@ describe("turn steering (_lody/session/steer)", () => {
           plan: "Implement it",
           mode: "auto",
         },
-        usageBaseline: previousUsage,
+        usageQueryReading: previousUsage,
         unknownUsageCostModels: unknownCosts,
       },
     );
@@ -17396,9 +17396,10 @@ describe("turn steering (_lody/session/steer)", () => {
     );
     expect(JSON.stringify(updates)).not.toContain('"status":"failed"');
     expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-    expect(agent.sessions["test-session"].usageQueryOffset).toEqual(previousUsage);
-    expect(agent.sessions["test-session"].usageBaseline).toEqual(previousUsage);
-    expect(agent.sessions["test-session"].unknownUsageCostModels).toBe(unknownCosts);
+    // The fresh query() counts from zero under new result scopes: no reading or
+    // guessed-cost marker from the replaced query may leak into it.
+    expect(agent.sessions["test-session"].usageQueryReading).toBeUndefined();
+    expect(agent.sessions["test-session"].unknownUsageCostModels).toBeUndefined();
     expect(agent.sessions["test-session"].titles).toBe(previousTitles);
   });
 
@@ -20023,5 +20024,181 @@ describe("permission_denied", () => {
     );
 
     expect(denials(updates)).toHaveLength(1);
+  });
+});
+
+describe("usage accounting scopes", () => {
+  const idleMessage = () => ({ type: "system", subtype: "session_state_changed", state: "idle" });
+  const sdkRow = (inputTokens: number, costUSD: number) => ({
+    inputTokens,
+    outputTokens: 10,
+    cacheReadInputTokens: 1000,
+    cacheCreationInputTokens: 0,
+    webSearchRequests: 0,
+    costUSD,
+    contextWindow: 200000,
+    maxOutputTokens: 32000,
+  });
+
+  function result(uuid: string, modelUsage: Record<string, Record<string, number>>) {
+    return {
+      type: "result",
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage,
+      permission_denials: [],
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  function setup(results: ReturnType<typeof result>[], overrides: Record<string, any> = {}) {
+    const usageUpdates: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async () => {},
+        extNotification: async (method: string, params: any) => {
+          if (method === "_lody/session/usage_update") usageUpdates.push(params);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(
+      agent,
+      async function* (input) {
+        const iter = input[Symbol.asyncIterator]();
+        for (const next of results) {
+          const { value } = await iter.next();
+          yield userEcho(value);
+          yield next;
+          yield idleMessage();
+        }
+      },
+      overrides,
+    );
+    const prompt = () =>
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    return { usageUpdates, prompt };
+  }
+
+  it("reports each result's own increment under its result uuid", async () => {
+    const { usageUpdates, prompt } = setup([
+      result("result-1", { main: sdkRow(100, 0.1) }),
+      result("result-2", { main: sdkRow(250, 0.25), haiku: sdkRow(30, 0.01) }),
+    ]);
+    await prompt();
+    await prompt();
+
+    expect(usageUpdates.map((u) => u._meta.lody.usageScopeId)).toEqual(["result-1", "result-2"]);
+    expect(usageUpdates[0].modelUsage.main).toMatchObject({
+      inputTokens: 100,
+      cacheReadInputTokens: 1000,
+    });
+    // The query-wide reading is cumulative; the second scope holds only the growth.
+    expect(usageUpdates[1].modelUsage.main).toMatchObject({
+      inputTokens: 150,
+      cacheReadInputTokens: 0,
+    });
+    expect(usageUpdates[1].modelUsage.main.costUSD).toBeCloseTo(0.15);
+    expect(usageUpdates[1].modelUsage.haiku).toMatchObject({ inputTokens: 30 });
+    // A scope is self-contained: its delta is exactly its cumulative content.
+    expect(usageUpdates[1].delta.modelUsage).toEqual(usageUpdates[1].modelUsage);
+  });
+
+  it("counts a restarted process's smaller readings in full under new scopes", async () => {
+    const before = setup([result("result-1", { main: sdkRow(5000, 5) })]);
+    await before.prompt();
+    // A resumed ACP session in a new process starts a new query() from zero.
+    const after = setup([result("result-2", { main: sdkRow(40, 0.04) })]);
+    await after.prompt();
+
+    expect(after.usageUpdates).toHaveLength(1);
+    expect(after.usageUpdates[0]._meta.lody.usageScopeId).toBe("result-2");
+    expect(after.usageUpdates[0].modelUsage.main).toMatchObject({ inputTokens: 40 });
+  });
+
+  it("counts only new work after a resume restores the saved running total", async () => {
+    // Claude Code seeds a resumed query() from the transcript's last cost-state,
+    // so its first result already carries every earlier turn.
+    const restored = {
+      "claude-haiku": {
+        inputTokens: 919,
+        outputTokens: 100,
+        thinkingTokens: 72,
+        cacheReadInputTokens: 15176,
+        cacheCreationInputTokens: 16129,
+        webSearchRequests: 0,
+        costUSD: 0.035,
+      },
+    };
+    const row = (inputTokens: number, outputTokens: number, cacheRead: number, cost: number) => ({
+      ...sdkRow(inputTokens, cost),
+      outputTokens,
+      thinkingTokens: 108,
+      cacheReadInputTokens: cacheRead,
+      cacheCreationInputTokens: 16678,
+    });
+    const { usageUpdates, prompt } = setup(
+      [result("resumed-1", { "claude-haiku": row(929, 143, 31305, 0.038) })],
+      {
+        pendingUsageBaseline: Promise.resolve({
+          known: true,
+          modelUsage: restored,
+          hasUnknownModelCost: false,
+        }),
+      },
+    );
+    await prompt();
+
+    expect(usageUpdates).toHaveLength(1);
+    expect(usageUpdates[0].modelUsage["claude-haiku"]).toMatchObject({
+      inputTokens: 10,
+      cacheReadInputTokens: 16129,
+      cacheCreationInputTokens: 549,
+    });
+    expect(usageUpdates[0].modelUsage["claude-haiku"].costUSD).toBeCloseTo(0.003);
+  });
+
+  it("anchors on the first result when the restored total is unknown", async () => {
+    const { usageUpdates, prompt } = setup(
+      [
+        result("history-included", { main: sdkRow(5000, 5) }),
+        result("zeroed", {}),
+        result("next", { main: sdkRow(5040, 5.04) }),
+      ],
+      { pendingUsageBaseline: Promise.resolve({ known: false }) },
+    );
+    await prompt();
+    await prompt();
+    await prompt();
+
+    // The first reading may be mostly history, and a zeroed crash result must
+    // not reset the reading: only the last result's own work is reported.
+    expect(usageUpdates.map((u) => u._meta.lody.usageScopeId)).toEqual(["next"]);
+    expect(usageUpdates[0].modelUsage.main).toMatchObject({ inputTokens: 40 });
+  });
+
+  it("emits nothing for a result that added no usage", async () => {
+    const { usageUpdates, prompt } = setup([
+      result("result-1", { main: sdkRow(100, 0.1) }),
+      result("result-2", { main: sdkRow(100, 0.1) }),
+    ]);
+    await prompt();
+    await prompt();
+
+    expect(usageUpdates.map((u) => u._meta.lody.usageScopeId)).toEqual(["result-1"]);
   });
 });

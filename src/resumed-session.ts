@@ -1,5 +1,11 @@
-import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getSessionMessages,
+  importSessionToStore,
+  type SessionMessage,
+  type SessionStoreEntry,
+} from "@anthropic-ai/claude-agent-sdk";
 import { SessionTiming } from "./session-timing.js";
+import type { SdkUsageCounters } from "./usage.js";
 
 type ResumeLogger = {
   log: (...args: unknown[]) => void;
@@ -54,5 +60,49 @@ export async function readResumedSession(
     timing.phase("read-transcript", " outcome=error");
     logger?.error(`Failed to read transcript for resumed session ${sessionId}:`, error);
     return {};
+  }
+}
+
+/** Accounting baseline a resumed query() starts from. `known: false` means the
+ * transcript could not be read, so the first result must only anchor. */
+export type ResumedUsageBaseline =
+  | { known: true; modelUsage: Record<string, SdkUsageCounters>; hasUnknownModelCost: boolean }
+  | { known: false };
+
+/** Claude Code restores `result.modelUsage` from the transcript's last
+ * `cost-state` record: its own for a resume, the source session's for a
+ * resume + forkSession. No record means the running total starts from zero.
+ * Per-message usage is not a substitute: it omits internal pipeline calls. */
+export function usageBaselineFromTranscript(entries: SessionStoreEntry[]): ResumedUsageBaseline {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.type !== "cost-state") continue;
+    const modelUsage = entry.modelUsage;
+    if (!modelUsage || typeof modelUsage !== "object") break;
+    return {
+      known: true,
+      modelUsage: modelUsage as Record<string, SdkUsageCounters>,
+      hasUnknownModelCost: entry.hasUnknownModelCost === true,
+    };
+  }
+  return { known: true, modelUsage: {}, hasUnknownModelCost: false };
+}
+
+export async function readResumedUsageBaseline(
+  sessionId: string,
+  logger?: ResumeLogger,
+): Promise<ResumedUsageBaseline> {
+  const entries: SessionStoreEntry[] = [];
+  try {
+    // Search every project directory, like the SDK's own resume lookup.
+    await importSessionToStore(
+      sessionId,
+      { append: async (_key, batch) => void entries.push(...batch), load: async () => null },
+      { includeSubagents: false },
+    );
+    return usageBaselineFromTranscript(entries);
+  } catch (error) {
+    logger?.error(`Failed to read usage baseline for resumed session ${sessionId}:`, error);
+    return { known: false };
   }
 }

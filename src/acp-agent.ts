@@ -158,7 +158,12 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import {
+  readResumedSession,
+  readResumedUsageBaseline,
+  type ResumedSessionSnapshot,
+  type ResumedUsageBaseline,
+} from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
@@ -239,7 +244,13 @@ import {
   type RateLimitsGetRequest,
   type RateLimitsGetResponse,
 } from "acp-extension-core";
-import { accountingDelta, addAccountingUsage, getUsage, toAccountingModelUsage } from "./usage.js";
+import {
+  getUsage,
+  isZeroUsageReading,
+  resultUsageIncrement,
+  toAccountingModelUsage,
+  usageBaselineSessionState,
+} from "./usage.js";
 
 type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
   availableCommands: AvailableCommand[];
@@ -853,9 +864,17 @@ type Turn = {
 };
 
 export type Session = {
+  /** Models whose cost in this query() includes a guessed rate. */
   unknownUsageCostModels?: Set<string>;
-  usageBaseline?: Record<string, ModelUsageExt>;
-  usageQueryOffset?: Record<string, ModelUsageExt>;
+  /** Last accounting reading of this query(), seeded with the running total a
+   *  resumed query() restores. Each result reports its increment under its own
+   *  usage scope, so nothing carries across query replacement. */
+  usageQueryReading?: Record<string, ModelUsageExt>;
+  /** The resumed transcript could not be read, so the restored running total is
+   *  unknown: the first result only anchors the reading. */
+  usageReadingUnknown?: boolean;
+  /** Restored running total of a resumed query(), applied before its first result. */
+  pendingUsageBaseline?: Promise<ResumedUsageBaseline>;
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -2090,9 +2109,6 @@ export class ClaudeAcpAgent {
         await this.createSession(params, options);
         const session = this.sessions[options.publicSessionId];
         if (!session) throw new Error("Fresh Claude context was not created");
-        session.usageQueryOffset = oldSession?.usageBaseline ?? oldSession?.usageQueryOffset;
-        session.usageBaseline = oldSession?.usageBaseline;
-        session.unknownUsageCostModels = oldSession?.unknownUsageCostModels;
         if (oldSession) session.titles = oldSession.titles;
         return session;
       },
@@ -5209,6 +5225,11 @@ export class ClaudeAcpAgent {
 
               const extNotification = this.client.extNotification?.bind(this.client);
               if (extNotification) {
+                if (session.pendingUsageBaseline) {
+                  const baseline = await session.pendingUsageBaseline;
+                  session.pendingUsageBaseline = undefined;
+                  Object.assign(session, usageBaselineSessionState(baseline));
+                }
                 const queryUsage: Record<string, ModelUsageExt> = {};
                 for (const [model, usage] of Object.entries(message.modelUsage)) {
                   queryUsage[model] = toAccountingModelUsage(usage);
@@ -5219,23 +5240,38 @@ export class ClaudeAcpAgent {
                   // earlier requests. A later known rate cannot validate old guesses.
                   if (session.unknownUsageCostModels?.has(model)) delete queryUsage[model].costUSD;
                 }
-                const modelUsage = addAccountingUsage(session.usageQueryOffset, queryUsage);
-                const usages = {
-                  sessionId: params.sessionId,
-                  usage: {
-                    inputTokens: message.usage.input_tokens,
-                    outputTokens: message.usage.output_tokens,
-                    cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
-                    cacheReadInputTokens: message.usage.cache_read_input_tokens,
-                  },
-                  modelUsage,
-                  delta: accountingDelta(modelUsage, session.usageBaseline),
-                };
-                await extNotification(
-                  LODY_EXTENSION_METHODS.sessionUsageUpdate,
-                  usages as unknown as Record<string, unknown>,
-                );
-                session.usageBaseline = modelUsage;
+                // Each result is its own accounting scope holding only what it
+                // added to the query-wide reading. A restarted process starts a
+                // new query() from zero and new result uuids, so it can never
+                // re-enter an old scope below its recorded total.
+                const anchorOnly = session.usageReadingUnknown === true;
+                const increment = anchorOnly
+                  ? undefined
+                  : resultUsageIncrement(queryUsage, session.usageQueryReading);
+                // Crash/startup-error results may carry zeroed usage; keep the
+                // reading so the next real result is not billed from zero.
+                if (!isZeroUsageReading(queryUsage)) {
+                  session.usageQueryReading = queryUsage;
+                  session.usageReadingUnknown = false;
+                }
+                if (increment) {
+                  const usages = {
+                    sessionId: params.sessionId,
+                    usage: {
+                      inputTokens: message.usage.input_tokens,
+                      outputTokens: message.usage.output_tokens,
+                      cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
+                      cacheReadInputTokens: message.usage.cache_read_input_tokens,
+                    },
+                    modelUsage: increment.modelUsage,
+                    delta: increment,
+                    _meta: { lody: { usageScopeId: message.uuid } },
+                  };
+                  await extNotification(
+                    LODY_EXTENSION_METHODS.sessionUsageUpdate,
+                    usages as unknown as Record<string, unknown>,
+                  );
+                }
                 const limits = await getUsage();
                 if (limits) {
                   await extNotification(
@@ -8132,6 +8168,12 @@ export class ClaudeAcpAgent {
       resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
       timing.phase("resume-transcript");
     }
+    // A resumed query() (including resume + forkSession) continues the running
+    // usage total saved in the `resume` transcript; everything else starts at
+    // zero. Read it off the load critical path: only the first result needs it.
+    const usageBaseline = creationOpts.resume
+      ? readResumedUsageBaseline(creationOpts.resume, this.logger)
+      : undefined;
 
     const input = new Pushable<SDKUserMessage>();
 
@@ -8708,6 +8750,7 @@ export class ClaudeAcpAgent {
         },
         accumulatedModelUsage: {},
         lastModelUsageReading: {},
+        pendingUsageBaseline: usageBaseline,
         modes,
         models,
         modelInfos,

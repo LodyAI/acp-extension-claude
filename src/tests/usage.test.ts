@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   accountingDelta,
-  addAccountingUsage,
   getUsage,
+  resultUsageIncrement,
   toAccountingModelUsage,
   type UsageApiDeps,
 } from "../usage.js";
@@ -30,24 +30,25 @@ const usage = (response: Awaited<ReturnType<UsageApiDeps["fetchApi"]>>) =>
   });
 
 describe("OAuth usage windows", () => {
-  it("carries billed model totals across private-query resets without double billing", () => {
-    const row = {
-      inputTokens: 100,
-      outputTokens: 40,
+  it("scopes one result's growth and treats a restarted reading as new work", () => {
+    const row = (inputTokens: number, costUSD?: number) => ({
+      inputTokens,
+      outputTokens: 10,
       cacheReadInputTokens: 20,
-      reasoningOutputTokens: 10,
-    };
-    const before = { main: row, previousChild: { ...row, costUSD: 0.4 } };
-    const query = { main: { ...row, inputTokens: 5, costUSD: 0.2 } };
-    const after = addAccountingUsage(before, query);
-    expect(after.main.inputTokens).toBe(105);
-    expect(after.main.reasoningOutputTokens).toBe(20);
-    expect(after.main.costUSD).toBeUndefined();
-    expect(after.previousChild).toEqual(before.previousChild);
-    expect(accountingDelta(after, before)?.usage.inputTokens).toBe(5);
-    expect(addAccountingUsage(before, query)).toEqual(after);
-    expect(before.main.inputTokens).toBe(100);
-    expect(addAccountingUsage({ main: { ...row, costUSD: 0.3 } }, query).main.costUSD).toBe(0.5);
+      ...(costUSD === undefined ? {} : { costUSD }),
+    });
+    const previous = { main: row(100, 0.1), idle: row(5, 0) };
+    const grown = resultUsageIncrement({ main: row(150, 0.3), idle: row(5, 0) }, previous);
+    expect(Object.keys(grown?.modelUsage ?? {})).toEqual(["main"]);
+    expect(grown?.modelUsage.main).toMatchObject({
+      inputTokens: 50,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+    });
+    expect(grown?.usage.costUSD).toBeCloseTo(0.2);
+    // Counters below the previous reading mean a new query() started from zero.
+    expect(resultUsageIncrement({ main: row(20) }, previous)?.modelUsage.main.inputTokens).toBe(20);
+    expect(resultUsageIncrement(previous, previous)).toBeUndefined();
   });
   it("differences query-wide model usage, keeping unknown cost and resets explicit", () => {
     const row = (inputTokens: number) => ({
