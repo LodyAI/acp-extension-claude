@@ -239,7 +239,7 @@ import {
   type RateLimitsGetRequest,
   type RateLimitsGetResponse,
 } from "acp-extension-core";
-import { accountingDelta, addAccountingUsage, getUsage, toAccountingModelUsage } from "./usage.js";
+import { getUsage, resultUsageIncrement, toAccountingModelUsage } from "./usage.js";
 
 type NewSessionResponseWithAvailableCommands = NewSessionResponse & {
   availableCommands: AvailableCommand[];
@@ -853,9 +853,11 @@ type Turn = {
 };
 
 export type Session = {
+  /** Models whose cost in this query() includes a guessed rate. */
   unknownUsageCostModels?: Set<string>;
-  usageBaseline?: Record<string, ModelUsageExt>;
-  usageQueryOffset?: Record<string, ModelUsageExt>;
+  /** Last accounting reading of this query(); each result reports its increment
+   *  under its own usage scope, so nothing carries across query replacement. */
+  usageQueryReading?: Record<string, ModelUsageExt>;
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -2090,9 +2092,6 @@ export class ClaudeAcpAgent {
         await this.createSession(params, options);
         const session = this.sessions[options.publicSessionId];
         if (!session) throw new Error("Fresh Claude context was not created");
-        session.usageQueryOffset = oldSession?.usageBaseline ?? oldSession?.usageQueryOffset;
-        session.usageBaseline = oldSession?.usageBaseline;
-        session.unknownUsageCostModels = oldSession?.unknownUsageCostModels;
         if (oldSession) session.titles = oldSession.titles;
         return session;
       },
@@ -5219,23 +5218,30 @@ export class ClaudeAcpAgent {
                   // earlier requests. A later known rate cannot validate old guesses.
                   if (session.unknownUsageCostModels?.has(model)) delete queryUsage[model].costUSD;
                 }
-                const modelUsage = addAccountingUsage(session.usageQueryOffset, queryUsage);
-                const usages = {
-                  sessionId: params.sessionId,
-                  usage: {
-                    inputTokens: message.usage.input_tokens,
-                    outputTokens: message.usage.output_tokens,
-                    cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
-                    cacheReadInputTokens: message.usage.cache_read_input_tokens,
-                  },
-                  modelUsage,
-                  delta: accountingDelta(modelUsage, session.usageBaseline),
-                };
-                await extNotification(
-                  LODY_EXTENSION_METHODS.sessionUsageUpdate,
-                  usages as unknown as Record<string, unknown>,
-                );
-                session.usageBaseline = modelUsage;
+                // Each result is its own accounting scope holding only what it
+                // added to the query-wide reading. A restarted process starts a
+                // new query() from zero and new result uuids, so it can never
+                // re-enter an old scope below its recorded total.
+                const increment = resultUsageIncrement(queryUsage, session.usageQueryReading);
+                session.usageQueryReading = queryUsage;
+                if (increment) {
+                  const usages = {
+                    sessionId: params.sessionId,
+                    usage: {
+                      inputTokens: message.usage.input_tokens,
+                      outputTokens: message.usage.output_tokens,
+                      cacheCreationInputTokens: message.usage.cache_creation_input_tokens,
+                      cacheReadInputTokens: message.usage.cache_read_input_tokens,
+                    },
+                    modelUsage: increment.modelUsage,
+                    delta: increment,
+                    _meta: { lody: { usageScopeId: message.uuid } },
+                  };
+                  await extNotification(
+                    LODY_EXTENSION_METHODS.sessionUsageUpdate,
+                    usages as unknown as Record<string, unknown>,
+                  );
+                }
                 const limits = await getUsage();
                 if (limits) {
                   await extNotification(

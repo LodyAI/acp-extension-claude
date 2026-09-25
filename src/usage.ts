@@ -8,7 +8,7 @@ import { execFileSync } from "child_process";
 import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
 import { z } from "zod";
 import type { ModelUsage as SdkModelUsage } from "@anthropic-ai/claude-agent-sdk";
-import type { ModelUsage } from "acp-extension-core";
+import { sumModelUsage, type ModelUsage } from "acp-extension-core";
 
 /** SDK thinking is a subset of output; costBasis=unknown is a guessed rate,
  * not a known cost. Callers must also remember earlier unknown costs in a query. */
@@ -23,41 +23,6 @@ export function toAccountingModelUsage(usage: SdkModelUsage): ModelUsage {
     ...(usage.costBasis === "unknown" ? {} : { costUSD: usage.costUSD }),
     contextWindow: usage.contextWindow,
   };
-}
-
-/** Carry billed usage across a private Query replacement in the same ACP session. */
-export function addAccountingUsage(
-  offset: Record<string, ModelUsage> = {},
-  current: Record<string, ModelUsage>,
-): Record<string, ModelUsage> {
-  const result = Object.fromEntries(
-    Object.entries(offset).map(([model, row]) => [model, { ...row }]),
-  );
-  for (const [model, row] of Object.entries(current)) {
-    const old = offset[model];
-    if (!old) {
-      result[model] = { ...row };
-      continue;
-    }
-    const combined = { ...row };
-    for (const key of [
-      "inputTokens",
-      "outputTokens",
-      "cacheReadInputTokens",
-      "cacheCreationInputTokens",
-      "reasoningOutputTokens",
-      "webSearchRequests",
-    ] as const) {
-      if (old[key] !== undefined || row[key] !== undefined) {
-        combined[key] = (old[key] ?? 0) + (row[key] ?? 0);
-      }
-    }
-    if (old.costUSD !== undefined && row.costUSD !== undefined) {
-      combined.costUSD = old.costUSD + row.costUSD;
-    } else delete combined.costUSD;
-    result[model] = combined;
-  }
-  return result;
 }
 
 /** Differences SDK query snapshots, including subagents. A decreasing counter
@@ -99,6 +64,30 @@ export function accountingDelta(
   }
   if (knownCost) usage.costUSD = cost;
   return { usage, modelUsage };
+}
+
+/** What one SDK result added to the query-wide reading, as a self-contained
+ * usage scope. A decreasing counter means the reading restarted, so the whole
+ * current reading is new work. Rows without new work are dropped; returns
+ * undefined when the result added nothing. */
+export function resultUsageIncrement(
+  current: Record<string, ModelUsage>,
+  previous?: Record<string, ModelUsage>,
+): { usage: ModelUsage; modelUsage: Record<string, ModelUsage> } | undefined {
+  const delta = accountingDelta(current, previous) ?? accountingDelta(current);
+  if (!delta) return undefined;
+  const modelUsage = Object.fromEntries(
+    Object.entries(delta.modelUsage).filter(
+      ([, row]) =>
+        row.inputTokens + row.outputTokens + row.cacheReadInputTokens > 0 ||
+        (row.cacheCreationInputTokens ?? 0) > 0 ||
+        (row.reasoningOutputTokens ?? 0) > 0 ||
+        (row.webSearchRequests ?? 0) > 0 ||
+        (row.costUSD ?? 0) > 0,
+    ),
+  );
+  if (Object.keys(modelUsage).length === 0) return undefined;
+  return { usage: sumModelUsage(modelUsage), modelUsage };
 }
 
 interface CredentialsFile {
