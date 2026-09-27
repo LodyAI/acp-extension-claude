@@ -25,6 +25,14 @@ Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
 ## Lody extensions
 
+With bilateral `_meta.lody.subagentEvents: { version: 1 }`, native subagent
+lifecycle, SDK progress, and child text/thought/tool/plan updates use Core's
+root-scoped `_lody/subagents/event` envelope. Legacy clients retain their existing
+native or task-metadata path. Child permission tools are namespaced on the root
+connection; normalized runs do not advertise cancellation or output-tail queries.
+Live child history is retained by Lody, not replayed into the parent's transcript.
+Standalone releases require a Core version exporting the subagent event helper.
+
 The adapter advertises versioned capabilities under
 `agentCapabilities._meta.lody` using the contracts from `acp-extension-core`.
 These cover usage and rate-limit reporting, an independent rate-limit query,

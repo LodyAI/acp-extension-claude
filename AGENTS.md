@@ -50,6 +50,12 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
   `_meta.lody.turnId`. `_meta.lody.forkAtTurn.turnId` returns that value unchanged
   and passes it directly to `resumeSessionAt`; do not maintain a message-id mapping.
 
+## Subagent events
+
+- Negotiate Core subagent events before routing child output. Preserve parent
+  ancestry and permission attribution; never replay child content into the main
+  conversation or advertise run controls backed only by legacy task IDs.
+
 ## Releasing
 
 Releases are fully automated by release-please. There is no manual release

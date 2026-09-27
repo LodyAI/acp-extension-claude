@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { isLodySubagentEvent, type LodySubagentEvent } from "acp-extension-core";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   announceNativeSubagent,
@@ -56,6 +57,82 @@ function control(
 }
 
 describe("NativeSubagentRuntime lifecycle", () => {
+  it("routes negotiated output and permission mirrors to a root-scoped run, with fresh IDs on reuse", async () => {
+    const events: LodySubagentEvent[] = [];
+    const legacy: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      false,
+      "root",
+      {},
+      async (event) => {
+        legacy.push(event);
+      },
+      { log() {} },
+      async (event) => {
+        events.push(event);
+      },
+    );
+    const deliver = async (event: AcpSessionNotification) => {
+      const routed = await runtime.route(event, deliver);
+      if (routed) {
+        const output = await runtime.lodyOutput(routed);
+        if (output) legacy.push(output);
+      }
+    };
+    await deliver(control("tool_call", "pending"));
+    await runtime.taskStarted(
+      { taskId: "native", toolUseId: "agent-tool", subagentType: "Explore" },
+      deliver,
+    );
+    const first = events[0].runId;
+    await deliver({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Working" },
+        _meta: { claudeCode: { parentToolUseId: "agent-tool" } },
+      },
+    });
+    await runtime.progress("native", { lastToolName: "Read", toolCallCount: 1 });
+    const permission = runtime.permissionMeta("agent-tool", "read");
+    const mirror = await runtime.lodyOutput(
+      {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "read",
+          title: "Read file",
+          _meta: { claudeCode: { parentToolUseId: "agent-tool" } },
+        },
+      },
+      true,
+    );
+    expect(mirror).toMatchObject({
+      sessionId: "root",
+      update: {
+        toolCallId: permission?.toolCallId,
+        _meta: { lody: { subagentRunId: first, subagentToolCallId: "read" } },
+      },
+    });
+    await runtime.finishTask("native", "completed", deliver);
+    await deliver({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "late" },
+        _meta: { claudeCode: { parentToolUseId: "agent-tool" } },
+      },
+    });
+    await deliver(control("tool_call", "pending"));
+    await runtime.taskStarted(
+      { taskId: "native", toolUseId: "agent-tool", subagentType: "Explore" },
+      deliver,
+    );
+    expect(events.at(-1)?.runId).not.toBe(first);
+    expect(events.filter((event) => event.type === "output")).toHaveLength(2);
+    expect(legacy).toEqual([]);
+    expect(events.every(isLodySubagentEvent)).toBe(true);
+  });
   it("publishes a raced spawn exactly once", async () => {
     const release = deferred();
     const published: AcpSessionNotification[] = [];

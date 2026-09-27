@@ -1,4 +1,9 @@
 import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
+import {
+  LodySubagentEmitter,
+  type LodySubagentEvent,
+  type LodySubagentProgress,
+} from "acp-extension-core";
 
 export type NativeSubagent = {
   sessionId: string;
@@ -47,6 +52,9 @@ const MAX_PENDING_UPDATES_PER_PARENT = 32;
  * ordering. The main agent only supplies SDK facts and delivers routed output.
  */
 export class NativeSubagentRuntime {
+  readonly lody?: LodySubagentEmitter;
+  private readonly lostParents = new Set<string>();
+  private readonly publish: Publish;
   readonly enabled: boolean;
 
   private readonly children: Map<string, NativeSubagent>;
@@ -64,10 +72,46 @@ export class NativeSubagentRuntime {
     enabled: boolean,
     private readonly rootSessionId: string,
     private readonly session: NativeSubagentSession,
-    private readonly publish: Publish,
+    publish: Publish,
     private readonly logger: Logger,
+    emitLody?: (event: LodySubagentEvent) => Promise<void>,
   ) {
-    this.enabled = enabled;
+    this.enabled = enabled || !!emitLody;
+    this.lody = emitLody ? new LodySubagentEmitter(rootSessionId, emitLody) : undefined;
+    this.publish = async (notification) => {
+      if (!this.lody) return publish(notification);
+      const update = notification.update;
+      if (update.sessionUpdate === "subagent_spawned") {
+        const child = [...this.children.values()].find(
+          (item) => item.sessionId === update.subagentSessionId,
+        );
+        await this.lody.start(update.subagentSessionId, {
+          state: "running",
+          name: update.name,
+          description: update.task,
+          ...(notification.sessionId === rootSessionId
+            ? { parentRunId: null }
+            : { parentRunId: this.lody.get(notification.sessionId)?.runId }),
+          ...(child?.parentToolUseId ? { parentToolCallId: child.parentToolUseId } : {}),
+          ...(child?.parentToolUseId && this.lostParents.has(child.parentToolUseId)
+            ? { outputIncomplete: true }
+            : {}),
+          support: {
+            stream: ["text", "thought", "tool", "plan"],
+            progress: true,
+            outputRead: "none",
+            cancel: false,
+          },
+        });
+      } else if (update.sessionUpdate === "subagent_state_update") {
+        await this.lody.snapshot(update.subagentSessionId, {
+          state: update.state === "disconnected" ? "unknown" : update.state,
+          ...(update.state === "disconnected"
+            ? { outputIncomplete: true, reason: { code: "disconnected" } }
+            : {}),
+        });
+      }
+    };
     this.children = session.nativeSubagentsByTaskId ??= new Map();
     this.taskByToolUse = session.nativeSubagentTaskIdByToolUseId ??= new Map();
     this.parentByToolUse = session.nativeSubagentParentByToolUseId ??= new Map();
@@ -76,6 +120,54 @@ export class NativeSubagentRuntime {
         this.childByParentToolUse.set(child.parentToolUseId, child);
       }
     }
+  }
+
+  async progress(taskId: string, progress: LodySubagentProgress): Promise<void> {
+    const child = this.children.get(taskId);
+    if (child) await this.lody?.progress(child.sessionId, progress);
+  }
+
+  permissionMeta(parentToolUseId: string | undefined, toolCallId: string) {
+    const child = parentToolUseId ? this.childByParentToolUse.get(parentToolUseId) : undefined;
+    const run =
+      child && this.lody?.live(child.sessionId) ? this.lody.get(child.sessionId) : undefined;
+    return run
+      ? {
+          toolCallId: `subagent:${encodeURIComponent(run.runId)}:${encodeURIComponent(toolCallId)}`,
+          lody: { subagentRunId: run.runId, subagentToolCallId: toolCallId },
+        }
+      : undefined;
+  }
+
+  async lodyOutput(
+    notification: AcpSessionNotification,
+    mirror = false,
+  ): Promise<AcpSessionNotification | null> {
+    if (!this.lody) return notification;
+    const meta = notification.update._meta?.claudeCode as { parentToolUseId?: string } | undefined;
+    const child =
+      (meta?.parentToolUseId ? this.childByParentToolUse.get(meta.parentToolUseId) : undefined) ??
+      [...this.children.values()].find((item) => item.sessionId === notification.sessionId);
+    if (!child) return notification;
+    await this.lody.output(child.sessionId, notification.update);
+    const update = notification.update;
+    if (
+      mirror &&
+      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
+    ) {
+      const permission = this.permissionMeta(child.parentToolUseId, update.toolCallId);
+      if (permission)
+        return {
+          ...notification,
+          sessionId: this.rootSessionId,
+          update: {
+            ...update,
+            toolCallId: permission.toolCallId,
+            _meta: { ...update._meta, lody: permission.lody },
+          },
+        };
+    }
+    return null;
   }
 
   async route(
@@ -245,6 +337,7 @@ export class NativeSubagentRuntime {
       }
     } finally {
       this.pending.clear();
+      this.lostParents.clear();
       this.pendingCount = 0;
       this.identityByToolUse.clear();
       this.controlByToolUse.clear();
@@ -268,6 +361,7 @@ export class NativeSubagentRuntime {
     this.taskFinishPromises.clear();
     this.generationByTaskId.clear();
     this.pending.clear();
+    this.lostParents.clear();
     this.pendingCount = 0;
   }
 
@@ -290,6 +384,7 @@ export class NativeSubagentRuntime {
       this.logger.log(
         `Session ${this.rootSessionId}: dropping unattributed subagent update for ${parentToolUseId}; pending buffer limit reached`,
       );
+      this.lostParents.add(parentToolUseId);
       return;
     }
     if (updates) updates.push(notification);
