@@ -1,3 +1,4 @@
+import { supportsLodySubagentEvents, LODY_SUBAGENT_EVENT_METHOD } from "acp-extension-core";
 import {
   agent as acpAgent,
   AgentContext,
@@ -454,6 +455,7 @@ export const CLAUDE_LODY_CAPABILITIES = {
   },
   tasks: { version: 1, background: true },
   subagents: { version: 1, lifecycle: true },
+  subagentEvents: { version: 1 },
   goal: { version: 1, actions: GOAL_ACTIONS },
   compaction: { version: 1 },
 } as const satisfies LodyExtensionCapabilities;
@@ -3365,6 +3367,9 @@ export class ClaudeAcpAgent {
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
+      supportsLodySubagentEvents(this.clientCapabilities)
+        ? (event) => this.client.extNotification(LODY_SUBAGENT_EVENT_METHOD, { ...event })
+        : undefined,
     ));
     const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
@@ -3418,7 +3423,8 @@ export class ClaudeAcpAgent {
           session.titles.onAssistantText(update.content);
         }
       }
-      await this.client.sessionUpdate(routedNotification);
+      const output = await subagents.lodyOutput(routedNotification, !!eagerOwnerSessionId);
+      if (output) await this.client.sessionUpdate(output);
       if (
         toolCallId &&
         update.sessionUpdate === "tool_call_update" &&
@@ -4018,7 +4024,8 @@ export class ClaudeAcpAgent {
       if (isSubagent) subagentTaskIds.add(message.task_id);
       if (
         isSubagent
-          ? clientSupportsSubagents(this.clientCapabilities)
+          ? clientSupportsSubagents(this.clientCapabilities) ||
+            supportsLodySubagentEvents(this.clientCapabilities)
           : clientSupportsAsyncTasks(this.clientCapabilities)
       )
         return;
@@ -4728,6 +4735,13 @@ export class ClaudeAcpAgent {
               case "files_persisted":
                 break;
               case "task_progress":
+                await subagents.progress(message.task_id, {
+                  summary: message.summary,
+                  lastToolName: message.last_tool_name,
+                  totalTokens: message.usage?.total_tokens,
+                  toolCallCount: message.usage?.tool_uses,
+                  durationMs: message.usage?.duration_ms,
+                });
                 await emitTaskLifecycle(message);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
@@ -7085,6 +7099,8 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
+      // Lody retains live child histories itself; do not replay them as root output.
+      if (parentToolUseId && supportsLodySubagentEvents(this.clientCapabilities)) continue;
       const replayTargetSessionId =
         nativeReplayEnabled && parentToolUseId
           ? await announceReplayChild(parentToolUseId)
@@ -7262,6 +7278,17 @@ export class ClaudeAcpAgent {
     // Do not rely on every ACP client settling requestPermission after the
     // cancellation signal. The local race guarantees that Claude's tool call
     // is released even when an older or broken client ignores $/cancel_request.
+    const attribution = this.sessions[ownerSessionId]?.nativeSubagentRuntime?.permissionMeta(
+      parentToolUseId,
+      params.toolCall.toolCallId,
+    );
+    if (attribution)
+      params = {
+        ...params,
+        sessionId: ownerSessionId,
+        toolCall: { ...params.toolCall, toolCallId: attribution.toolCallId },
+        _meta: { ...params._meta, lody: attribution.lody },
+      };
     try {
       return await this.withPendingUserInput(params.sessionId, () =>
         raceWithAbort(this.client.requestPermission(params, signal), signal),
@@ -7321,7 +7348,11 @@ export class ClaudeAcpAgent {
       };
     }
     try {
-      const emission = this.client.sessionUpdate({ sessionId: notificationSessionId, update });
+      const notification = { sessionId: notificationSessionId, update };
+      const normalized = session.nativeSubagentRuntime
+        ? await session.nativeSubagentRuntime.lodyOutput(notification, true)
+        : notification;
+      const emission = normalized ? this.client.sessionUpdate(normalized) : Promise.resolve();
       await (signal ? raceWithAbort(emission, signal) : emission);
     } catch (error) {
       // The set is also the de-duplication guard for the later streamed
@@ -7369,6 +7400,13 @@ export class ClaudeAcpAgent {
       const parentToolUseId = agentID
         ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
         : undefined;
+      const lodyChild = session.nativeSubagentRuntime?.permissionMeta(parentToolUseId, toolUseID);
+      if (supportsLodySubagentEvents(this.clientCapabilities) && agentID && !lodyChild) {
+        return {
+          behavior: "deny",
+          message: "Subagent execution ownership is not available for this request.",
+        };
+      }
       const permissionSessionId =
         clientSupportsSubagents(this.clientCapabilities) && agentID
           ? (() => {
@@ -7410,7 +7448,13 @@ export class ClaudeAcpAgent {
           signal,
           permissionSessionId,
         );
-        return this.handleAskUserQuestion(permissionSessionId, toolInput, toolUseID, signal);
+        return this.handleAskUserQuestion(
+          lodyChild ? sessionId : permissionSessionId,
+          toolInput,
+          lodyChild?.toolCallId ?? toolUseID,
+          signal,
+          lodyChild?.lody,
+        );
       }
 
       // Do not auto-allow here based on the session's advertised mode. Claude
@@ -7577,6 +7621,7 @@ export class ClaudeAcpAgent {
     toolInput: Record<string, unknown>,
     toolUseID: string,
     signal: AbortSignal,
+    lodyChild?: { subagentRunId: string; subagentToolCallId: string },
   ): Promise<PermissionResult> {
     const questions = extractAskUserQuestions(toolInput);
     if (!questions) {
@@ -7590,6 +7635,11 @@ export class ClaudeAcpAgent {
       toolUseID,
       answerNotes,
     );
+    if (lodyChild)
+      createRequest._meta = {
+        ...createRequest._meta,
+        lody: { ...(createRequest._meta?.lody as object), ...lodyChild },
+      };
     let response;
     try {
       response = await this.withPendingUserInput(sessionId, () =>
@@ -8252,6 +8302,7 @@ export class ClaudeAcpAgent {
     if (userProvidedOptions) delete userProvidedOptions.agent;
     const forwardSubagentText =
       clientSupportsSubagents(this.clientCapabilities) ||
+      supportsLodySubagentEvents(this.clientCapabilities) ||
       supportsSubagentTranscript(this.clientCapabilities) ||
       userProvidedOptions?.forwardSubagentText === true;
 
