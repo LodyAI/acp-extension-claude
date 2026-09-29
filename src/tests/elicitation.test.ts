@@ -301,7 +301,7 @@ describe("askUserQuestionsToCreateRequest", () => {
       mkQuestion("What else?", [{ label: "C" }, { label: "D" }]),
     ];
     const schema = (
-      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
+      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined, true) as Extract<
         CreateElicitationRequest,
         { mode: "form" }
       >
@@ -332,6 +332,18 @@ describe("askUserQuestionsToCreateRequest", () => {
         },
       },
     });
+
+    // A client that is not AIR gets the field without the AIR marker.
+    const plain = (
+      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
+        CreateElicitationRequest,
+        { mode: "form" }
+      >
+    ).requestedSchema;
+    expect(plain.properties?.["question_0_custom"]).toMatchObject({
+      _meta: { lody: { elicitation: { version: 1, customAnswerFor: "question_0" } } },
+    });
+    expect(plain.properties?.["question_0_custom"]).not.toHaveProperty("_meta.jetbrains");
   });
 
   it("builds an array property for multi-select questions and includes per-field question text", () => {

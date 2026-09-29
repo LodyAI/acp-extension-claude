@@ -34,6 +34,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
+        interrupt: async () => undefined,
+        close: () => {},
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -96,6 +98,48 @@ describe("createSession options merging", () => {
 
     agent = new ClaudeAcpAgent(createMockClient());
   });
+
+  for (const method of ["resumeSession", "loadSession"] as const) {
+    for (const limit of ["maxTurns", "maxBudgetUsd"] as const) {
+      it(`${method} applies added, tightened and removed ${limit} to the SDK query`, async () => {
+        const cwd = process.cwd();
+        const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+        for (const value of [10, 1, undefined]) {
+          const previousOptions = capturedOptions;
+          await agent[method]({
+            sessionId,
+            cwd,
+            mcpServers: [],
+            _meta: { claudeCode: { options: { [limit]: value } } },
+          });
+
+          expect(capturedOptions).not.toBe(previousOptions);
+          expect(capturedOptions?.[limit]).toBe(value);
+          expect(capturedOptions?.resume).toBe(sessionId);
+        }
+      });
+    }
+
+    it(`${method} reuses the SDK query when execution limits are unchanged`, async () => {
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxTurns: 10, maxBudgetUsd: 1 } } },
+      });
+      const previousOptions = capturedOptions;
+
+      await agent[method]({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxBudgetUsd: 1, maxTurns: 10 } } },
+      });
+
+      expect(capturedOptions).toBe(previousOptions);
+    });
+  }
 
   describe("allowDangerouslySkipPermissions", () => {
     it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
@@ -337,6 +381,36 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  it("recreates a resumed Query with changed skills and the same session ID", async () => {
+    const created = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf"] },
+        },
+      },
+    });
+    const initialQuery = agent.sessions[created.sessionId]!.query;
+    expect(capturedOptions!.skills).toEqual(["pdf"]);
+
+    await agent.resumeSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["docx"] },
+        },
+      },
+    });
+
+    expect(Object.keys(agent.sessions)).toEqual([created.sessionId]);
+    expect(agent.sessions[created.sessionId]!.query).not.toBe(initialQuery);
+    expect(capturedOptions!.resume).toBe(created.sessionId);
+    expect(capturedOptions!.skills).toEqual(["docx"]);
   });
 
   describe("subagent transcript forwarding", () => {
@@ -798,25 +872,39 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("does not call getContextUsage during session creation", async () => {
-      // getContextUsage stalls until the session's first prompt turn has run
-      // (it is not serviced pre-turn), so session/new must never call it —
+    it("does not wait for getContextUsage during session creation", async () => {
+      // SDK control requests are serialized and getContextUsage used to stall
+      // until the first prompt turn, so session/new only kicks it off —
       // awaiting it inline is what regressed session/new latency in 0.59.0.
-      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
       contextUsageResult = ctxSpy;
 
-      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(ctxSpy).toHaveBeenCalledOnce();
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+    it("refines a guessed window from getContextUsage in the background", async () => {
       // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the window falls back to
-      // the default; the authoritative value arrives later via result.modelUsage.
+      // no "1m" token anywhere, so inference misses and the seed is the default
+      // until the background getContextUsage answers.
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+    });
+
+    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
+      contextUsageResult = ctxSpy;
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
@@ -864,7 +952,7 @@ describe("createSession options merging", () => {
       expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
         "haiku",
       );
-      expect(ctxSpy).not.toHaveBeenCalled();
+      // Kicked off in the background, never awaited: it never answers here.
       expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");

@@ -4,8 +4,14 @@ import {
   type SessionMessage,
   type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
+import { access, open, readdir } from "node:fs/promises";
+import path from "node:path";
+import { claudeConfigDir } from "./paths.js";
 import { SessionTiming } from "./session-timing.js";
 import type { SdkUsageCounters } from "./usage.js";
+
+/** The size of one backward read of a transcript. */
+const TAIL_CHUNK_BYTES = 64 * 1024;
 
 type ResumeLogger = {
   log: (...args: unknown[]) => void;
@@ -33,12 +39,17 @@ export function resumedModelFromTranscript(messages: SessionMessage[]): string |
     ) {
       continue;
     }
-    const model = (entry.message as { model?: unknown }).model;
-    if (typeof model === "string" && model.trim().length > 0 && !/^<[^>]+>$/.test(model.trim())) {
-      return model.trim();
-    }
+    const model = concreteModel((entry.message as { model?: unknown }).model);
+    if (model) return model;
   }
   return undefined;
+}
+
+/** The model name, or undefined for a missing or a synthetic `<…>` model. */
+function concreteModel(model: unknown): string | undefined {
+  if (typeof model !== "string") return undefined;
+  const name = model.trim();
+  return name.length > 0 && !/^<[^>]+>$/.test(name) ? name : undefined;
 }
 
 /** Read the resume model from the local transcript without starting a Claude
@@ -105,4 +116,93 @@ export async function readResumedUsageBaseline(
     logger?.error(`Failed to read usage baseline for resumed session ${sessionId}:`, error);
     return { known: false };
   }
+}
+
+/**
+ * Read the resume model of a session from the end of its local transcript.
+ *
+ * A resume needs only the model, not the messages. The transcript file is
+ * read backwards until the last real assistant record of the main thread, so
+ * the cost does not grow with the length of the session. A session without a
+ * local transcript file falls back to {@link readResumedSession}.
+ */
+export async function readResumedModel(
+  sessionId: string,
+  logger?: ResumeLogger,
+): Promise<string | undefined> {
+  const timing = new SessionTiming(logger, "models", sessionId);
+  try {
+    const filePath = await findTranscript(sessionId);
+    if (filePath) {
+      const model = await lastAssistantModel(filePath);
+      timing.phase("read-transcript-tail", ` model=${model ?? "unknown"}`);
+      return model;
+    }
+  } catch (error) {
+    timing.phase("read-transcript-tail", " outcome=error");
+    logger?.error(`Failed to read the transcript tail of resumed session ${sessionId}:`, error);
+  }
+  return (await readResumedSession(sessionId, logger)).model;
+}
+
+/** The local transcript of a session in any project directory, as the SDK looks it up. */
+export async function findTranscript(sessionId: string): Promise<string | undefined> {
+  const projects = path.join(claudeConfigDir(), "projects");
+  let directories: string[];
+  try {
+    directories = await readdir(projects);
+  } catch {
+    return undefined;
+  }
+  for (const directory of directories) {
+    const candidate = path.join(projects, directory, `${sessionId}.jsonl`);
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // Not in this project directory.
+    }
+  }
+  return undefined;
+}
+
+/** The model of the last real assistant record of the main thread in a JSONL transcript. */
+async function lastAssistantModel(filePath: string): Promise<string | undefined> {
+  const handle = await open(filePath, "r");
+  try {
+    let end = (await handle.stat()).size;
+    // The bytes of the line whose start is not read yet, in file order.
+    let pending: Buffer[] = [];
+    while (end > 0) {
+      const start = Math.max(0, end - TAIL_CHUNK_BYTES);
+      let chunk = Buffer.alloc(end - start);
+      await handle.read(chunk, 0, chunk.length, start);
+      for (let at = chunk.lastIndexOf(0x0a); at >= 0; at = chunk.lastIndexOf(0x0a)) {
+        const model = assistantModelOfLine(Buffer.concat([chunk.subarray(at + 1), ...pending]));
+        if (model) return model;
+        pending = [];
+        chunk = chunk.subarray(0, at);
+      }
+      pending.unshift(chunk);
+      end = start;
+    }
+    return assistantModelOfLine(Buffer.concat(pending));
+  } finally {
+    await handle.close();
+  }
+}
+
+function assistantModelOfLine(line: Buffer): string | undefined {
+  // Most lines are not assistant records. The check skips their JSON parse.
+  if (line.indexOf('"assistant"') < 0) return undefined;
+  let entry: unknown;
+  try {
+    entry = JSON.parse(line.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!entry || typeof entry !== "object") return undefined;
+  const record = entry as { type?: unknown; isSidechain?: unknown; message?: { model?: unknown } };
+  if (record.type !== "assistant" || record.isSidechain === true) return undefined;
+  return concreteModel(record.message?.model);
 }
