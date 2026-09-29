@@ -4,6 +4,7 @@ import {
   type LodySubagentEvent,
   type LodySubagentProgress,
 } from "acp-extension-core";
+import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 
 export type NativeSubagent = {
   sessionId: string;
@@ -11,6 +12,11 @@ export type NativeSubagent = {
   parentToolUseId?: string;
   name: string;
   task: string;
+  /**
+   * The exact prompt of this generation, sent as `prompt` in
+   * `subagent_spawned`. It is absent when the adapter has no prompt.
+   */
+  prompt?: string;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -46,6 +52,8 @@ type SubagentIdentity = {
 const MAX_PENDING_PARENTS = 64;
 const MAX_PENDING_UPDATES = 256;
 const MAX_PENDING_UPDATES_PER_PARENT = 32;
+/** The number of child tool calls whose owning child session the runtime remembers. */
+const MAX_CHILD_TOOL_CALLS = 2048;
 
 /**
  * Owns the connection-local native subagent registry and all ACP lifecycle
@@ -63,6 +71,12 @@ export class NativeSubagentRuntime {
   private readonly identityByToolUse = new Map<string, SubagentIdentity>();
   private readonly controlByToolUse = new Map<string, AcpSessionNotification>();
   private readonly childByParentToolUse = new Map<string, NativeSubagent>();
+  /**
+   * The child session of each tool call that went to a child session. A later
+   * update of that tool call can lose `parentToolUseId`, for example a progress
+   * beat after the child finished. It still belongs to the child session.
+   */
+  private readonly childByToolCall = new Map<string, NativeSubagent>();
   private readonly taskFinishPromises = new Map<string, Promise<void>>();
   private readonly generationByTaskId = new Map<string, number>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
@@ -177,7 +191,7 @@ export class NativeSubagentRuntime {
   ): Promise<AcpSessionNotification | null> {
     const { update } = notification;
     const claudeMeta = update._meta?.claudeCode as
-      { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
+      { parentToolUseId?: string | null; toolName?: string } | undefined;
     const isControl = isNativeSubagentControlUpdate(update);
 
     if (!this.enabled) return notification;
@@ -218,11 +232,23 @@ export class NativeSubagentRuntime {
       return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
     }
 
+    const toolCallId =
+      update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update"
+        ? update.toolCallId
+        : undefined;
+
     // A permission request may have had to create the tool call before native
     // child ownership was known. Keep every later update in that original ACP
     // session; moving a lifecycle after its initial call creates an orphan in
     // both transcripts.
-    if (forcedSessionId) return { ...notification, sessionId: forcedSessionId };
+    if (forcedSessionId) {
+      const forcedChild = this.childOfSession(forcedSessionId);
+      if (toolCallId && forcedChild) this.rememberToolCallOwner(toolCallId, forcedChild);
+      return { ...notification, sessionId: forcedSessionId };
+    }
+
+    const owner = toolCallId ? this.childByToolCall.get(toolCallId) : undefined;
+    if (owner) return this.toChild(owner, notification, toolCallId);
 
     if (this.enabled && claudeMeta?.parentToolUseId) {
       const child = this.childByParentToolUse.get(claudeMeta.parentToolUseId);
@@ -230,13 +256,7 @@ export class NativeSubagentRuntime {
         this.buffer(claudeMeta.parentToolUseId, notification);
         return null;
       }
-      if (child.terminalState !== undefined || child.terminalPromise) {
-        this.logger.log(
-          `Session ${this.rootSessionId}: ignoring late update for terminal subagent ${child.sessionId}`,
-        );
-        return null;
-      }
-      return { ...notification, sessionId: child.sessionId };
+      return this.toChild(child, notification, toolCallId);
     }
 
     return notification;
@@ -254,40 +274,64 @@ export class NativeSubagentRuntime {
     const previous = this.children.get(task.taskId);
     if (previous && previous.terminalState === undefined) return;
 
-    const knownParentSessionId = task.toolUseId
-      ? this.parentByToolUse.get(task.toolUseId)
-      : undefined;
+    // A SendMessage resume reuses the finished generation's tool id, whose
+    // control state is already cleaned up.
+    const knownParentSessionId =
+      (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
+      (previous && this.resumedParentSessionId(previous));
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
-    const child: NativeSubagent = {
-      sessionId: this.nextChildSessionId(task.taskId, previous),
-      parentSessionId: knownParentSessionId ?? this.rootSessionId,
-      parentToolUseId: task.toolUseId ?? undefined,
-      name: subagentDisplayName(
-        identity?.name,
-        identity?.description ?? task.description,
-        identity?.subagentType ?? task.subagentType,
-        task.taskId,
-      ),
-      task: subagentDescription(
-        identity?.prompt ?? task.prompt,
-        identity?.description ?? task.description,
-      ),
-    };
-    this.children.set(task.taskId, child);
-    if (task.toolUseId) {
-      this.taskByToolUse.set(task.toolUseId, task.taskId);
-      this.childByParentToolUse.set(task.toolUseId, child);
-      this.controlByToolUse.delete(task.toolUseId);
-    }
-
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
-    if (knownParentSessionId || !task.toolUseId) {
-      await announceNativeSubagent(child, this.publish);
-      for (const pending of task.toolUseId ? this.takePending(task.toolUseId) : []) {
-        await deliver(pending);
-      }
-    }
+    await this.openGeneration(
+      task.taskId,
+      previous,
+      {
+        parentSessionId: knownParentSessionId ?? this.rootSessionId,
+        parentToolUseId: task.toolUseId ?? undefined,
+        name: subagentDisplayName(
+          identity?.name,
+          identity?.description ?? task.description,
+          identity?.subagentType ?? task.subagentType,
+          task.taskId,
+        ),
+        task: subagentDescription(
+          identity?.prompt ?? task.prompt,
+          identity?.description ?? task.description,
+        ),
+        ...promptField(promptText(task.prompt) ?? identity?.prompt),
+      },
+      !!knownParentSessionId || !task.toolUseId,
+      deliver,
+    );
+  }
+
+  /**
+   * Opens a new generation of a finished child when the SDK resumes the same
+   * agent id. The SDK can resume a child without a new `task_started`, so a
+   * running `task_updated` patch or a SendMessage `resumedAgentId` is the
+   * signal. A child that did not finish is not changed. The `prompt` is the
+   * SendMessage text that resumed the child, when the adapter knows it.
+   */
+  async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
+    if (!this.enabled) return;
+    const previous = this.children.get(taskId);
+    if (!previous) return;
+    const finishing = this.taskFinishPromises.get(taskId) ?? previous.terminalPromise;
+    if (finishing) await finishing.catch(() => {});
+    if (this.children.get(taskId) !== previous || previous.terminalState === undefined) return;
+    await this.openGeneration(
+      taskId,
+      previous,
+      {
+        parentSessionId: this.resumedParentSessionId(previous),
+        parentToolUseId: previous.parentToolUseId,
+        name: previous.name,
+        task: previous.task,
+        ...promptField(promptText(prompt)),
+      },
+      true,
+      deliver,
+    );
   }
 
   async finishTask(
@@ -351,8 +395,65 @@ export class NativeSubagentRuntime {
     this.takePending(parentToolUseId);
   }
 
+  /**
+   * Routes an update to the child session. An update of a finished child is
+   * dropped: it never goes to the root session.
+   */
+  private toChild(
+    child: NativeSubagent,
+    notification: AcpSessionNotification,
+    toolCallId: string | undefined,
+  ): AcpSessionNotification | null {
+    if (child.terminalState !== undefined || child.terminalPromise) {
+      this.logger.log(
+        `Session ${this.rootSessionId}: ignoring late update for terminal subagent ${child.sessionId}`,
+      );
+      return null;
+    }
+    if (toolCallId) this.rememberToolCallOwner(toolCallId, child);
+    return { ...notification, sessionId: child.sessionId };
+  }
+
+  /**
+   * The route of the work that a child tool call started, for example an async
+   * task. The route sends each update to the child generation that owned the
+   * tool call when the work started, and drops the update after that child
+   * finished. `undefined` means that the root session owns the tool call.
+   * `eagerSessionId` is the session where a permission request created the
+   * tool call before the stream routed it.
+   */
+  routeOfToolCall(
+    toolCallId: string,
+    eagerSessionId?: string,
+  ): ((notification: AcpSessionNotification) => AcpSessionNotification | null) | undefined {
+    if (!this.enabled) return undefined;
+    const owner =
+      this.childByToolCall.get(toolCallId) ??
+      (eagerSessionId ? this.childOfSession(eagerSessionId) : undefined);
+    return owner && ((notification) => this.toChild(owner, notification, undefined));
+  }
+
+  private rememberToolCallOwner(toolCallId: string, child: NativeSubagent): void {
+    this.childByToolCall.delete(toolCallId);
+    this.childByToolCall.set(toolCallId, child);
+    if (this.childByToolCall.size > MAX_CHILD_TOOL_CALLS) {
+      const oldest = this.childByToolCall.keys().next().value;
+      if (oldest !== undefined) this.childByToolCall.delete(oldest);
+    }
+  }
+
+  /** The child generation with the ACP session `sessionId`, if one exists. */
+  private childOfSession(sessionId: string): NativeSubagent | undefined {
+    if (sessionId === this.rootSessionId) return undefined;
+    for (const child of this.children.values()) {
+      if (child.sessionId === sessionId) return child;
+    }
+    return undefined;
+  }
+
   clear(): void {
     this.children.clear();
+    this.childByToolCall.clear();
     this.taskByToolUse.clear();
     this.parentByToolUse.clear();
     this.identityByToolUse.clear();
@@ -398,6 +499,52 @@ export class NativeSubagentRuntime {
     this.parentByToolUse.delete(toolUseId);
   }
 
+  /** The parent of a resumed generation: the old parent while it is live, else the root. */
+  private resumedParentSessionId(previous: NativeSubagent): string {
+    return this.isLiveSession(previous.parentSessionId)
+      ? previous.parentSessionId
+      : this.rootSessionId;
+  }
+
+  private isLiveSession(sessionId: string): boolean {
+    if (sessionId === this.rootSessionId) return true;
+    for (const child of this.children.values()) {
+      if (child.sessionId === sessionId) return child.terminalState === undefined;
+    }
+    return false;
+  }
+
+  /**
+   * Registers a new child session for the task and makes it the owner of its
+   * parent tool call. With `announce`, it publishes `subagent_spawned` and
+   * delivers the updates that waited for the child.
+   */
+  private async openGeneration(
+    taskId: string,
+    previous: NativeSubagent | undefined,
+    fields: Pick<
+      NativeSubagent,
+      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt"
+    >,
+    announce: boolean,
+    deliver: Publish,
+  ): Promise<void> {
+    const child: NativeSubagent = {
+      sessionId: this.nextChildSessionId(taskId, previous),
+      ...fields,
+    };
+    const toolUseId = child.parentToolUseId;
+    this.children.set(taskId, child);
+    if (toolUseId) {
+      this.taskByToolUse.set(toolUseId, taskId);
+      this.childByParentToolUse.set(toolUseId, child);
+      this.controlByToolUse.delete(toolUseId);
+    }
+    if (!announce) return;
+    await announceNativeSubagent(child, this.publish);
+    for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
+  }
+
   private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
     if (!previous) {
       this.generationByTaskId.set(taskId, 1);
@@ -423,6 +570,7 @@ export async function announceNativeSubagent(
         subagentSessionId: child.sessionId,
         name: child.name,
         task: child.task,
+        ...promptField(child.prompt),
         capabilities: {},
       },
     });
@@ -465,6 +613,41 @@ export async function finishNativeSubagent(
   }
 }
 
+/**
+ * The agent id that a successful SendMessage result resumed. The SDK puts it
+ * in `tool_use_result.resumedAgentId` when a finished agent runs again.
+ */
+export function resumedNativeSubagentId(toolUseResult: unknown): string | undefined {
+  if (typeof toolUseResult !== "object" || toolUseResult === null) return undefined;
+  const result = toolUseResult as { success?: unknown; resumedAgentId?: unknown };
+  return result.success === true ? nonBlankString(result.resumedAgentId) : undefined;
+}
+
+/**
+ * The SendMessage text that resumed the agent `agentId`. The tool uses of
+ * `resultToolUseIds` come first: they are the SendMessage calls whose result
+ * carried the resume. Otherwise the latest SendMessage call to `agentId` counts.
+ */
+export function sendMessageResumePrompt(
+  toolUses: Record<string, { name: string; input: unknown } | undefined>,
+  agentId: string,
+  resultToolUseIds: readonly string[] = [],
+): string | undefined {
+  for (const toolUseId of resultToolUseIds) {
+    const toolUse = toolUses[toolUseId];
+    if (toolUse?.name !== "SendMessage") continue;
+    const text = promptText((toolUse.input as { message?: unknown } | null)?.message);
+    if (text) return text;
+  }
+  if (resultToolUseIds.length > 0) return undefined;
+  for (const toolUse of Object.values(toolUses).reverse()) {
+    if (toolUse?.name !== "SendMessage") continue;
+    const input = toolUse.input as { to?: unknown; message?: unknown } | null;
+    if (input?.to === agentId) return promptText(input.message);
+  }
+  return undefined;
+}
+
 export function nativeSubagentState(status: unknown): SubagentState | undefined {
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
@@ -482,8 +665,11 @@ export function isNativeSubagentControlUpdate(
   if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
     return false;
   }
-  const claudeMeta = update._meta?.claudeCode as { subagent?: true; toolName?: string } | undefined;
-  return claudeMeta?.subagent === true || isNativeSubagentControlTool(claudeMeta?.toolName);
+  const claudeMeta = update._meta?.claudeCode as { toolName?: string } | undefined;
+  return (
+    airExtensionMeta(update._meta)?.[AIR_SUBAGENT_KEY] === true ||
+    isNativeSubagentControlTool(claudeMeta?.toolName)
+  );
 }
 
 export function isNativeSubagentControlTool(toolName: unknown): boolean {
@@ -561,8 +747,14 @@ function ordinaryToolMeta(
       (value) => (value?.claudeCode as Record<string, unknown> | null | undefined) ?? {},
     ),
   );
-  delete claudeCode.subagent;
-  return { ...merged, claudeCode };
+  const result: Record<string, unknown> = { ...merged, claudeCode };
+  const air = airExtensionMeta(merged);
+  if (air && AIR_SUBAGENT_KEY in air) {
+    const rest = { ...air };
+    delete rest[AIR_SUBAGENT_KEY];
+    result.jetbrains = { ...(merged.jetbrains as Record<string, unknown>), air: rest };
+  }
+  return result;
 }
 
 function subagentDisplayName(
@@ -591,7 +783,7 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
   const identity: SubagentIdentity = {
     name: nonBlankString(value.name),
     description: nonBlankString(value.description),
-    prompt: nonBlankString(value.prompt),
+    prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
@@ -625,6 +817,16 @@ function applySubagentIdentity(
   if (identity.prompt || identity.description) {
     child.task = subagentDescription(identity.prompt, identity.description);
   }
+  child.prompt ??= identity.prompt;
+}
+
+/** The prompt text unchanged, or `undefined` when it is not a non-blank string. */
+function promptText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function promptField(prompt: string | undefined): { prompt?: string } {
+  return prompt === undefined ? {} : { prompt };
 }
 
 function nonBlankString(value: unknown): string | undefined {

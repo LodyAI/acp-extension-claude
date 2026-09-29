@@ -293,6 +293,48 @@ describe("ClaudeAcpAgent settings", () => {
     );
   });
 
+  it.each(["user", "project"] as const)(
+    "honors permissions.disableBypassPermissionsMode from %s settings",
+    async (tier) => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(path.join(projectDir, ".claude"), { recursive: true });
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          permissions: {
+            defaultMode: "bypassPermissions",
+            ...(tier === "user" ? { disableBypassPermissionsMode: "disable" } : {}),
+          },
+        }),
+      );
+      if (tier === "project") {
+        await fs.promises.writeFile(
+          path.join(projectDir, ".claude", "settings.json"),
+          JSON.stringify({ permissions: { disableBypassPermissionsMode: "disable" } }),
+        );
+      }
+
+      const { getCapturedOptions } = mockQuery();
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+      (agent as any).logger = { log: () => {}, error: () => {} };
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(getCapturedOptions().allowDangerouslySkipPermissions).toBe(false);
+      expect(getCapturedOptions().permissionMode).toBe("default");
+      expect(response.modes.currentModeId).toBe("default");
+      expect(response.modes.availableModes.map((mode: { id: string }) => mode.id)).not.toContain(
+        "bypassPermissions",
+      );
+    },
+  );
+
   it("defaults to 'default' when no permissions.defaultMode is set", async () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
@@ -446,30 +488,27 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
+      // A client that is not AIR gets no mode kind.
       expect(response.modes.availableModes.slice(0, 4)).toEqual([
         {
           id: "default",
           name: "Manual",
           description: "Always ask before making changes",
-          _meta: { kind: "standard" },
         },
         {
           id: "acceptEdits",
           name: "Accept edits",
           description: "Automatically accept all file edits",
-          _meta: { kind: "standard" },
         },
         {
           id: "plan",
           name: "Plan",
           description: "Create a plan before making changes",
-          _meta: { kind: "plan" },
         },
         {
           id: "auto",
           name: "Auto",
           description: "Claude handles permission decisions",
-          _meta: { kind: "auto_review" },
         },
       ]);
       const bypass = response.modes.availableModes[4];
@@ -478,7 +517,6 @@ describe("ClaudeAcpAgent settings", () => {
           id: "bypassPermissions",
           name: "Bypass permissions",
           description: "Accepts all permissions",
-          _meta: { kind: "full_access" },
         });
       }
       expect(modeIds).not.toContain("dontAsk");

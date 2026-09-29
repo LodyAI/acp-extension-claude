@@ -63,14 +63,22 @@ describe("session permission updates", () => {
       "exit-plan-accept-edits",
       "reject",
     ]);
-    expect(capturedPermissionRequest._meta).toEqual({
-      permission: { version: 1, title: "Ready to code?" },
-    });
+    // A client that is not AIR gets no permission presentation.
+    expect(capturedPermissionRequest._meta).toBeUndefined();
     expect(result.updatedPermissions).toEqual([
       { type: "setMode", mode: "default", destination: "session" },
     ]);
-    expect(agent.sessions[SESSION_ID].modes.currentModeId).toBe("plan");
-    expect(sessionUpdates).toHaveLength(0);
+    expect(agent.sessions[SESSION_ID].modes.currentModeId).toBe("default");
+    expect(sessionUpdates).toEqual([
+      {
+        sessionId: SESSION_ID,
+        update: { sessionUpdate: "current_mode_update", currentModeId: "default" },
+      },
+      {
+        sessionId: SESSION_ID,
+        update: { sessionUpdate: "config_option_update", configOptions: [] },
+      },
+    ]);
   });
 
   it("falls an Auto permission effect back when the current model cannot use Auto", async () => {
