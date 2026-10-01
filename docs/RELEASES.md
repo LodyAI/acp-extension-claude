@@ -7,7 +7,9 @@ keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
 `autorelease: pending`.
 
 Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
-and publishes `acp-extension-claude` to npm.
+and publishes `acp-extension-claude` to npm. The publisher validates the tag,
+package identity/version and main ancestry, then builds the resolved commit SHA.
+It runs in the same workflow and never publishes a floating branch checkout.
 
 There is no manual versioning or release-creation path: versions are never typed
 in by hand and remain an output of the commit history. The workflow's manual
@@ -102,11 +104,14 @@ npm publishes through OIDC from inside the workflow, so this cannot be done from
 a laptop. Re-run the publish workflow against the existing tag:
 
 ```sh
-gh workflow run publish.yml -f ref="v<version>"
+gh workflow run publish.yml --ref main -f ref="v<version>"
 ```
 
-npm versions are immutable, so only use the manual publish path when the package
-version is still absent from npm.
+Only stable, non-draft GitHub releases whose commits belong to `main` are accepted.
+Arbitrary branch names and commit SHAs are rejected. npm versions are immutable,
+so only use the manual publish path when the package version is still absent from npm.
+Re-running the entire original workflow may produce no Release Please output;
+use manual dispatch to retry publication instead.
 
 ## Credentials
 
@@ -116,3 +121,20 @@ version is still absent from npm.
 
 Publishing to npm uses OIDC trusted publishing, so there is no npm token. All
 release jobs run in the `release` environment.
+
+## One-time setup
+
+- In GitHub Settings → Actions → General, allow Actions to create pull requests.
+- Configure npm trusted publishing for **LodyAI / acp-extension-claude**, workflow
+  **publish.yml**, environment **release**, allowing direct **npm publish**.
+  These values must match exactly. The workflow uses GitHub-hosted runners,
+  Node 24, npm 11 and `id-token: write`; no npm token is needed.
+- If the npm package does not exist yet, a maintainer must first publish it from a
+  validated checkout with their npm account, then configure the trusted publisher.
+  Do not point this workflow at another project's npm package.
+- Restrict the `release` environment to the selected branch `main` only (no
+  tag or wildcard rules), and protect `main` and workflow edits. npm trust does
+  not itself restrict the branch; an in-file branch guard is not a substitute
+  for this GitHub environment rule.
+- The `release` environment's deployment protection rules apply. Avoid required
+  reviewers there if merging the release PR should publish without another gate.

@@ -70,3 +70,7 @@ gh pr merge <pr-number> --squash
 The preflight is the guard-list as code; if it exits non-zero, follow what it
 prints rather than merging. Full runbook, including how to recover a stalled
 release: [`docs/RELEASES.md`](docs/RELEASES.md).
+
+Publication builds a validated release commit SHA in `publish.yml`; do not add a
+second tag-triggered publisher. npm trust is bound to `LodyAI/acp-extension-claude`,
+`publish.yml`, environment `release` (restricted to `main`).
