@@ -205,6 +205,7 @@ import {
   isSyntheticUsageLimitMessage,
   type PublishedSessionFailure,
   providerFailureCategory,
+  quotaRejectionMessage,
   SessionFailureController,
   type SessionFailureState,
   sessionFailureMeta,
@@ -4144,6 +4145,8 @@ export class ClaudeAcpAgent {
     let lastAssistantError: SDKAssistantMessageError | undefined;
     let lastAssistantWasUsageLimit = false;
     let lastAssistantFailureTitle: string | undefined;
+    // A restriction is a notice first; a native end boundary settles the turn.
+    let quotaNotice: { message: string; turnId?: string } | undefined;
     // When a streaming classifier refuses a turn, the assistant message carries
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
@@ -4455,6 +4458,7 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
+      if (quotaNotice?.turnId !== session.activeTurn?.promptUuid) quotaNotice = undefined;
       lastRefusalExplanation = null;
       // Do NOT reset currentStreamMessageId or the streamed blocks here. Turn
       // activation can fire mid-message (the replayed user echo with
@@ -5072,6 +5076,63 @@ export class ClaudeAcpAgent {
       }
     };
 
+    const reportQuotaNotice = async (
+      message: string,
+      turnId: string | undefined,
+    ): Promise<void> => {
+      if (quotaNotice && quotaNotice.turnId === turnId) return;
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { lody: { notice: { level: "error", source: "claude", message } } },
+        },
+      });
+      quotaNotice = { message, turnId };
+    };
+
+    const quotaErrorForClient = (message: string) =>
+      RequestError.internalError({
+        errorKind: "quota_exhausted",
+        details: message,
+        quotaNoticePublished: true,
+      });
+
+    const publishLimitedGoal = async (message: string): Promise<void> => {
+      const goal = session.lastPublishedGoal;
+      if (goal?.status === "active") {
+        await this.publishGoal(params.sessionId, {
+          ...goal,
+          status: "limited",
+          lastReason: message,
+        });
+      }
+    };
+
+    // Called only at an authoritative SDK end boundary, never on a notice.
+    const failQuotaTurn = async (): Promise<boolean> => {
+      const turn = session.activeTurn;
+      const notice = quotaNotice;
+      if (
+        session.cancelled ||
+        !turn ||
+        turn.settled ||
+        isHeldOpen(turn) ||
+        !notice ||
+        notice.turnId !== turn.promptUuid
+      ) {
+        return false;
+      }
+      await publishLimitedGoal(notice.message);
+      await failActiveWithSessionFailure(
+        "quota_exhausted",
+        quotaErrorForClient(notice.message),
+        notice.message,
+      );
+      quotaNotice = undefined;
+      return true;
+    };
+
     const subagentTaskIds = new Set<string>();
     const emitTaskLifecycle = async (message: ClaudeTaskLifecycleMessage) => {
       const acpSessionId =
@@ -5242,16 +5303,20 @@ export class ClaudeAcpAgent {
           // a deferred turn's stored outcome (followup results never mutate
           // it), but the stored one is the authoritative source.
           const inFlight = session.activeTurn;
+          const quotaAtEnd = session.cancelled ? undefined : quotaNotice;
+          if (quotaAtEnd) await publishLimitedGoal(quotaAtEnd.message);
           await finishLifecycle(
             session.cancelled ? "cancelled" : "failed",
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
           );
-          await settleActive(
-            session.cancelled
-              ? cancelledOutcome(session, inFlight)
-              : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
-          );
+          if (!(await failQuotaTurn())) {
+            await settleActive(
+              session.cancelled
+                ? cancelledOutcome(session, inFlight)
+                : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
+            );
+          }
           // Queued turns the SDK never started never ran, so reject them rather
           // than reporting a success (end_turn) — or a misleading "cancelled" —
           // for a prompt that produced no output. (A cancel already settled the
@@ -5261,10 +5326,15 @@ export class ClaudeAcpAgent {
             if (!queued.settled) {
               session.fileChangeReporter?.finish(queued.fileChangeReport, "providerError");
               queued.settled = true;
-              queued.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
+              queued.reject(
+                quotaAtEnd?.turnId === queued.promptUuid
+                  ? quotaErrorForClient(quotaAtEnd.message)
+                  : RequestError.internalError(undefined, SESSION_ENDED_MESSAGE),
+              );
             }
           }
           session.turnQueue = [];
+          quotaNotice = undefined;
           // The query iterator can't be revived, so close the session's stream
           // (marks queryClosed, drops the consumer handle, releases the dead
           // subprocess/settings resources) — a later prompt() then rejects up
@@ -5659,18 +5729,31 @@ export class ClaudeAcpAgent {
                     // a prompt the SDK is about to run. A turn abandoned
                     // before its echo therefore still hangs until cancel or
                     // the next prompt; only a timer could tell those apart.
-                    this.logger.error(
-                      `Session ${params.sessionId}: SDK went idle without emitting a result ` +
-                        `for the active turn; failing the in-flight prompt (issue #825)`,
-                    );
-                    await failActiveWithSessionFailure(
-                      "internal_error",
-                      RequestError.internalError(
-                        errorKindData("no_result"),
+                    if (!(await failQuotaTurn())) {
+                      this.logger.error(
+                        `Session ${params.sessionId}: SDK went idle without emitting a result ` +
+                          `for the active turn; failing the in-flight prompt (issue #825)`,
+                      );
+                      await failActiveWithSessionFailure(
+                        "internal_error",
+                        RequestError.internalError(
+                          errorKindData("no_result"),
+                          TURN_NO_RESULT_MESSAGE,
+                        ),
                         TURN_NO_RESULT_MESSAGE,
-                      ),
-                      TURN_NO_RESULT_MESSAGE,
-                    );
+                      );
+                    }
+                  }
+                  const backgroundQuota = quotaNotice;
+                  if (
+                    !session.cancelled &&
+                    !session.activeTurn &&
+                    backgroundQuota &&
+                    (backgroundQuota.turnId === undefined ||
+                      !findUnsettledTurn(backgroundQuota.turnId))
+                  ) {
+                    await publishLimitedGoal(backgroundQuota.message);
+                    quotaNotice = undefined;
                   }
                   // Turn-over is when a title may have landed or become
                   // generatable; see SessionTitles.onTurnEnd.
@@ -6195,6 +6278,7 @@ export class ClaudeAcpAgent {
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
+            let resultTurnId: string | undefined;
             try {
               // Reconcile the Fast mode toggle with the SDK's reported state.
               // Gated to user-driven turns like every other side effect below;
@@ -6273,6 +6357,10 @@ export class ClaudeAcpAgent {
                   }
                 }
               }
+
+              // Attribute the notice after echo-less promotion and held-turn
+              // handoff. Steered result UUIDs can differ from the ACP prompt ID.
+              resultTurnId = isAutonomousResult ? undefined : session.activeTurn?.promptUuid;
 
               // A result closes the stretch of output it terminates: snapshot
               // the delivery record — AFTER ensureActiveTurn, whose held-turn
@@ -6503,6 +6591,34 @@ export class ClaudeAcpAgent {
                 }
                 break;
               }
+
+              const quotaForResult = quotaNotice?.turnId === resultTurnId ? quotaNotice : undefined;
+              const failureKind = providerFailureCategory(
+                lastAssistantError,
+                lastAssistantWasUsageLimit,
+              );
+              const quotaFailure =
+                !supportsAirSessionFailures(this.clientCapabilities) &&
+                message.is_error &&
+                (failureKind === "quota_exhausted" ||
+                  (quotaForResult !== undefined &&
+                    (lastAssistantError === undefined || lastAssistantError === "rate_limit")));
+              if (quotaFailure) {
+                const explanation =
+                  lastAssistantFailureTitle ??
+                  quotaForResult?.message ??
+                  ("result" in message ? message.result : message.errors.join(", "));
+                if (!quotaNotice) await reportQuotaNotice(explanation, resultTurnId);
+                await publishLimitedGoal(explanation);
+                quotaNotice = {
+                  message: quotaNotice?.message ?? explanation,
+                  turnId: resultTurnId,
+                };
+              }
+              const resultErrorForClient = (detail: string) =>
+                quotaFailure
+                  ? quotaErrorForClient(quotaNotice?.message ?? detail)
+                  : internalErrorForClient(errorKindData(lastAssistantError), detail);
 
               // A held turn (see Turn.deferredSettle) settles at its
               // followup's terminal result: this is the earliest point at which
@@ -6744,8 +6860,8 @@ export class ClaudeAcpAgent {
                   }
                   if (message.is_error) {
                     await failActiveWithSessionFailure(
-                      providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(errorKindData(lastAssistantError), message.result),
+                      quotaFailure ? "quota_exhausted" : failureKind,
+                      resultErrorForClient(message.result),
                       lastAssistantFailureTitle ?? message.result,
                     );
                     break;
@@ -6803,11 +6919,8 @@ export class ClaudeAcpAgent {
                   }
                   if (message.is_error) {
                     await failActiveWithSessionFailure(
-                      providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
-                      internalErrorForClient(
-                        errorKindData(lastAssistantError),
-                        message.errors.join(", ") || message.subtype,
-                      ),
+                      quotaFailure ? "quota_exhausted" : failureKind,
+                      resultErrorForClient(message.errors.join(", ") || message.subtype),
                       lastAssistantFailureTitle ?? (message.errors.join(", ") || message.subtype),
                     );
                     break;
@@ -6901,6 +7014,7 @@ export class ClaudeAcpAgent {
                 await settleOrDefer(turnOutcome(session, stopReason));
               }
             } finally {
+              if (quotaNotice?.turnId === resultTurnId) quotaNotice = undefined;
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
                 // The early exits above (cancelled guard, refusal) skip the
@@ -7225,6 +7339,16 @@ export class ClaudeAcpAgent {
               if (message.error) {
                 lastAssistantError = message.error;
               }
+              if (
+                !supportsAirSessionFailures(this.clientCapabilities) &&
+                providerFailureCategory(message.error, lastAssistantWasUsageLimit) ===
+                  "quota_exhausted"
+              ) {
+                await reportQuotaNotice(
+                  lastAssistantFailureTitle ?? "The Claude account has no available quota.",
+                  session.activeTurn?.promptUuid ?? firstUnsettledQueuedTurn()?.promptUuid,
+                );
+              }
               if (message.message.stop_reason === "refusal") {
                 // Keep any explanation already seeded by a
                 // `model_refusal_no_fallback` banner — the banner/frame
@@ -7331,14 +7455,16 @@ export class ClaudeAcpAgent {
 
             // AIR receives this provider condition on the terminal prompt
             // response as a typed failure whose title is the exact assistant
-            // error text captured above. Do not duplicate that text as an
-            // ordinary assistant message; legacy clients retain the historical
-            // transcript behavior.
+            // error text captured above. Quota errors are already delivered
+            // through Core notices for Lody. Neither path duplicates the error
+            // as ordinary assistant prose.
             if (
               message.type === "assistant" &&
               message.parent_tool_use_id === null &&
               (message.error || isSyntheticUsageLimitMessage(message.message)) &&
-              supportsAirSessionFailures(this.clientCapabilities)
+              (supportsAirSessionFailures(this.clientCapabilities) ||
+                providerFailureCategory(message.error, lastAssistantWasUsageLimit) ===
+                  "quota_exhausted")
             ) {
               break;
             }
@@ -7498,6 +7624,13 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
+            const rejection = quotaRejectionMessage(message.rate_limit_info);
+            if (rejection && !supportsAirSessionFailures(this.clientCapabilities)) {
+              await reportQuotaNotice(
+                rejection,
+                session.activeTurn?.promptUuid ?? firstUnsettledQueuedTurn()?.promptUuid,
+              );
+            }
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: params.sessionId,

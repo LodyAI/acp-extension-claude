@@ -8935,12 +8935,25 @@ describe("stop reason propagation", () => {
     expect(agent.sessions["test-session"].contextUsedTokens).toBe(170910);
   });
 
-  it("preserves live usage-limit prose for clients without typed failures", async () => {
-    const updates: SessionNotification[] = [];
+  const quotaNoticeFor = (update: AcpSessionNotification) =>
+    (update.update._meta?.lody as { notice?: unknown } | undefined)?.notice;
+
+  const quotaSignal = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  };
+
+  it("reports live usage limits once and rejects at their terminal result", async () => {
+    const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
-        sessionUpdate: async (update: SessionNotification) => updates.push(update),
-      } as unknown as AcpClient,
+        sessionUpdate: async (update) => {
+          updates.push(update);
+        },
+      } as AcpClient,
       { log: () => {}, error: () => {} },
     );
     injectSession(agent, [
@@ -8955,8 +8968,558 @@ describe("stop reason propagation", () => {
 
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
-    ).rejects.toThrow("provider detail");
-    expect(JSON.stringify(updates)).toContain("individual spend limit");
+    ).rejects.toMatchObject({
+      code: -32603,
+      data: {
+        errorKind: "quota_exhausted",
+        details: expect.stringContaining("individual spend limit"),
+        quotaNoticePublished: true,
+      },
+    });
+    const notices = updates.filter((update) => quotaNoticeFor(update));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      update: {
+        _meta: { lody: { notice: { message: expect.stringContaining("individual spend limit") } } },
+      },
+    });
+    expect(
+      updates.filter((update) => update.update.sessionUpdate === "agent_message_chunk"),
+    ).toEqual([]);
+  });
+
+  it.each([
+    { priorModelFrame: false, subtype: "success", beforeEcho: false },
+    { priorModelFrame: true, subtype: "error_during_execution", beforeEcho: false },
+    { priorModelFrame: false, subtype: "success", beforeEcho: true },
+  ] as const)(
+    "notifies a quota rejection before result and keeps the SDK lifecycle for %j",
+    async ({ priorModelFrame, subtype, beforeEcho }) => {
+      const updates: AcpSessionNotification[] = [];
+      let notifyQuota!: () => void;
+      const quotaObserved = new Promise<void>((resolve) => {
+        notifyQuota = resolve;
+      });
+      let releaseResult!: () => void;
+      const resultGate = new Promise<void>((resolve) => {
+        releaseResult = resolve;
+      });
+      let endStream!: () => void;
+      const streamGate = new Promise<void>((resolve) => {
+        endStream = resolve;
+      });
+      let producerClosed = false;
+      let firstSettled = false;
+      let firstUsage: unknown;
+      let secondSettled = false;
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update) => {
+            updates.push(update);
+            if (quotaNoticeFor(update)) notifyQuota();
+          },
+        } as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      const input = new Pushable<any>();
+      async function* messages() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        if (!beforeEcho) yield userEcho(first.value);
+        yield {
+          type: "active_goal",
+          value: { condition: "Finish the synthetic task", iterations: 1, set_at: 1000 },
+        };
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "synthetic-background-command",
+          task_type: "local_bash",
+          description: "Synthetic background command",
+          is_backgrounded: true,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        if (priorModelFrame) {
+          const assistant = createAssistantError(undefined, "Working.");
+          assistant.message.usage.input_tokens = 17;
+          assistant.message.usage.output_tokens = 3;
+          yield assistant;
+        }
+        yield {
+          type: "rate_limit_event",
+          rate_limit_info: {
+            status: "rejected",
+            rateLimitType: "five_hour",
+            resetsAt: Date.parse("2026-10-19T20:00:00.000Z") / 1000,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        if (beforeEcho) yield userEcho(first.value);
+        await resultGate;
+        // This independent result must not consume the foreground quota incident.
+        yield successfulResultMessage({ origin: { kind: "task-notification" } });
+        yield {
+          ...createResultMessage({
+            subtype,
+            stop_reason: "end_turn",
+            is_error: true,
+            result: "Quota refused",
+            errors: ["Quota refused"],
+          }),
+          usage: {
+            input_tokens: 17,
+            output_tokens: 3,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        };
+        const second = await iter.next();
+        if (second.done) return;
+        yield userEcho(second.value);
+        // The first result's idle may arrive after the next prompt's echo.
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        yield createAssistantError(undefined, "Recovered.");
+        yield successfulResultMessage({ result: "Recovered." });
+        await streamGate;
+      }
+      const query = wrapQuery(messages());
+      query.close = () => {
+        producerClosed = true;
+      };
+      const session = mockSessionState({ query, input });
+      agent.sessions["test-session"] = session;
+      const first = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] })
+        .then(
+          (response) => {
+            firstSettled = true;
+            return response;
+          },
+          (error: unknown) => {
+            firstSettled = true;
+            firstUsage = { ...session.accumulatedUsage };
+            return error;
+          },
+        );
+      await quotaObserved;
+      const consumer = session.consumer;
+      try {
+        expect(firstSettled).toBe(false);
+        expect(producerClosed).toBe(false);
+        expect(session.lastPublishedGoal.status).toBe("active");
+        expect(session.liveBackgroundTasks.has("synthetic-background-command")).toBe(true);
+        const second = agent
+          .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "try again" }] })
+          .then((response) => {
+            secondSettled = true;
+            return response;
+          });
+        expect(secondSettled).toBe(false);
+        releaseResult();
+        expect(await first).toMatchObject({
+          data: {
+            errorKind: "quota_exhausted",
+            quotaNoticePublished: true,
+            details: expect.stringContaining("2026-10-19T20:00:00.000Z"),
+          },
+        });
+        expect(firstUsage).toMatchObject({ inputTokens: 17, outputTokens: 3 });
+        expect(await second).toMatchObject({ stopReason: "end_turn" });
+        expect(session.lastPublishedGoal).toMatchObject({
+          objective: "Finish the synthetic task",
+          status: "limited",
+        });
+        expect(producerClosed).toBe(false);
+        expect(session.queryClosed).not.toBe(true);
+        expect(agent.sessions["test-session"]).toBe(session);
+        expect(session.liveBackgroundTasks.has("synthetic-background-command")).toBe(true);
+        expect(updates.filter((update) => quotaNoticeFor(update))).toHaveLength(1);
+        const taskUpdates = updates.filter(
+          (update) => (update.update._meta?.lody as { task?: unknown } | undefined)?.task,
+        );
+        expect(taskUpdates.at(-1)).toMatchObject({
+          update: {
+            _meta: {
+              lody: { task: { taskId: "synthetic-background-command", status: "in_progress" } },
+            },
+          },
+        });
+        if (priorModelFrame) {
+          expect(
+            updates.filter((update) => update.update.sessionUpdate === "usage_update"),
+          ).toContainEqual(
+            expect.objectContaining({ update: expect.objectContaining({ used: 20 }) }),
+          );
+        }
+      } finally {
+        releaseResult();
+        endStream();
+        input.end();
+        await consumer;
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.each([
+    { end: "idle", beforeEcho: false, oldIdle: false },
+    { end: "idle", beforeEcho: false, oldIdle: true },
+    { end: "idle", beforeEcho: true, oldIdle: false },
+    { end: "eof", beforeEcho: false, oldIdle: false },
+    { end: "eof", beforeEcho: true, oldIdle: false },
+  ] as const)(
+    "returns an ACP quota error at native %j without waiting for a result",
+    async ({ end, beforeEcho, oldIdle }) => {
+      const updates: AcpSessionNotification[] = [];
+      const noticed = quotaSignal();
+      const earlierIdle = quotaSignal();
+      const allowEnd = quotaSignal();
+      const keepStream = quotaSignal();
+      let promptSettled = false;
+      let producerClosed = false;
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update) => {
+            updates.push(update);
+            if (quotaNoticeFor(update)) noticed.resolve();
+          },
+        } as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      const input = new Pushable<any>();
+      async function* messages() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        if (!beforeEcho) yield userEcho(first.value);
+        yield {
+          type: "active_goal",
+          value: { condition: "Finish the synthetic task", iterations: 1, set_at: 1000 },
+        };
+        yield {
+          type: "rate_limit_event",
+          rate_limit_info: { status: "rejected" },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        if (end === "idle" && (beforeEcho || oldIdle)) {
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          earlierIdle.resolve();
+        }
+        await allowEnd.promise;
+        if (end === "eof") return;
+        if (beforeEcho) yield userEcho(first.value);
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        const next = await iter.next();
+        if (next.done) return;
+        yield userEcho(next.value);
+        yield createAssistantError(undefined, "Recovered.");
+        yield successfulResultMessage();
+        await keepStream.promise;
+      }
+      const query = wrapQuery(messages());
+      query.close = () => {
+        producerClosed = true;
+      };
+      const session = mockSessionState({ query, input, owedTrailingIdles: oldIdle ? 1 : 0 });
+      agent.sessions["test-session"] = session;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] })
+        .then(
+          (response) => {
+            promptSettled = true;
+            return response;
+          },
+          (error: unknown) => {
+            promptSettled = true;
+            return error;
+          },
+        );
+      await noticed.promise;
+      const consumer = session.consumer;
+      try {
+        if (end === "idle" && (beforeEcho || oldIdle)) await earlierIdle.promise;
+        expect(promptSettled).toBe(false);
+        expect(producerClosed).toBe(false);
+        expect(session.lastPublishedGoal.status).toBe("active");
+        allowEnd.resolve();
+        expect(await prompt).toMatchObject({
+          code: -32603,
+          data: {
+            errorKind: "quota_exhausted",
+            details: "Claude account usage limit reached.",
+            quotaNoticePublished: true,
+          },
+        });
+        expect(session.lastPublishedGoal).toMatchObject({
+          objective: "Finish the synthetic task",
+          status: "limited",
+        });
+        expect(updates.filter((update) => quotaNoticeFor(update))).toHaveLength(1);
+        if (end === "idle") {
+          expect(producerClosed).toBe(false);
+          expect(agent.sessions["test-session"]).toBe(session);
+          expect(
+            await agent.prompt({
+              sessionId: "test-session",
+              prompt: [{ type: "text", text: "next" }],
+            }),
+          ).toMatchObject({ stopReason: "end_turn" });
+          expect(producerClosed).toBe(false);
+        } else {
+          await consumer;
+          expect(session.queryClosed).toBe(true);
+        }
+      } finally {
+        allowEnd.resolve();
+        keepStream.resolve();
+        input.end();
+        await consumer;
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.each(["idle", "eof"] as const)(
+    "limits an autonomous quota goal at native %s without a prompt waiter",
+    async (end) => {
+      const updates: AcpSessionNotification[] = [];
+      const triggerQuota = quotaSignal();
+      const noticed = quotaSignal();
+      const allowEnd = quotaSignal();
+      const limited = quotaSignal();
+      const keepStream = quotaSignal();
+      let producerClosed = false;
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update) => {
+            updates.push(update);
+            if (quotaNoticeFor(update)) noticed.resolve();
+            if (
+              (update.update._meta?.lody as { goal?: { status?: string } } | undefined)?.goal
+                ?.status === "limited"
+            )
+              limited.resolve();
+          },
+        } as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      const input = new Pushable<any>();
+      async function* messages() {
+        const first = await input[Symbol.asyncIterator]().next();
+        yield userEcho(first.value);
+        yield {
+          type: "active_goal",
+          value: { condition: "Finish the synthetic goal", iterations: 1, set_at: 1000 },
+        };
+        yield successfulResultMessage();
+        await triggerQuota.promise;
+        yield {
+          type: "rate_limit_event",
+          rate_limit_info: { status: "rejected" },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        await allowEnd.promise;
+        if (end === "eof") return;
+        // This can be the only idle after the prompt result and background work.
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        await keepStream.promise;
+      }
+      const query = wrapQuery(messages());
+      query.close = () => {
+        producerClosed = true;
+      };
+      const session = mockSessionState({ query, input });
+      agent.sessions["test-session"] = session;
+      expect(
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] }),
+      ).toMatchObject({ stopReason: "end_turn" });
+      const consumer = session.consumer;
+      try {
+        triggerQuota.resolve();
+        await noticed.promise;
+        expect(session.lastPublishedGoal.status).toBe("active");
+        expect(producerClosed).toBe(false);
+        allowEnd.resolve();
+        await limited.promise;
+        expect(session.lastPublishedGoal).toMatchObject({
+          objective: "Finish the synthetic goal",
+          status: "limited",
+        });
+        expect(updates.filter((update) => quotaNoticeFor(update))).toHaveLength(1);
+        if (end === "idle") {
+          expect(producerClosed).toBe(false);
+          expect(agent.sessions["test-session"]).toBe(session);
+        } else {
+          await consumer;
+          expect(session.queryClosed).toBe(true);
+        }
+      } finally {
+        triggerQuota.resolve();
+        allowEnd.resolve();
+        keepStream.resolve();
+        input.end();
+        await consumer;
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.each([
+    { status: "allowed" },
+    { status: "allowed_warning" },
+    { status: "rejected", overageStatus: "allowed" },
+    { status: "rejected", overageStatus: "allowed_warning" },
+  ])("keeps working for a non-blocking quota event %j", async (info) => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update) => {
+          updates.push(update);
+        },
+      } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectSession(agent, [
+      {
+        type: "rate_limit_event",
+        rate_limit_info: info,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      successfulResultMessage({ result: "The synthetic task finished." }),
+    ]);
+    expect(
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] }),
+    ).toMatchObject({ stopReason: "end_turn" });
+    expect(updates.filter((update) => quotaNoticeFor(update))).toEqual([]);
+  });
+
+  it("does not turn an earlier quota rejection into a failure when Claude recovers", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update) => {
+          updates.push(update);
+        },
+      } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectSession(agent, [
+      {
+        type: "active_goal",
+        value: { condition: "Finish the synthetic task", iterations: 1, set_at: 1000 },
+      },
+      {
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected" },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createAssistantError(undefined, "Recovered."),
+      successfulResultMessage(),
+    ]);
+    expect(
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] }),
+    ).toMatchObject({ stopReason: "end_turn" });
+    expect(agent.sessions["test-session"].lastPublishedGoal?.status).toBe("active");
+    expect(updates.filter((update) => quotaNoticeFor(update))).toHaveLength(1);
+  });
+
+  it("waits for the autonomous quota result without failing the next user prompt", async () => {
+    const updates: AcpSessionNotification[] = [];
+    let rejectQuota!: () => void;
+    const quotaGate = new Promise<void>((resolve) => {
+      rejectQuota = resolve;
+    });
+    let quotaObserved!: () => void;
+    const notified = new Promise<void>((resolve) => {
+      quotaObserved = resolve;
+    });
+    let releaseResult!: () => void;
+    const resultGate = new Promise<void>((resolve) => {
+      releaseResult = resolve;
+    });
+    let endStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      endStream = resolve;
+    });
+    let producerClosed = false;
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update) => {
+          updates.push(update);
+          if (quotaNoticeFor(update)) quotaObserved();
+        },
+      } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const input = new Pushable<any>();
+    async function* messages() {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      yield userEcho(first.value);
+      yield {
+        type: "active_goal",
+        value: { condition: "Finish the synthetic goal", iterations: 1, set_at: 1000 },
+      };
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      await quotaGate;
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected" },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      await resultGate;
+      yield successfulResultMessage({
+        is_error: true,
+        result: "Quota refused",
+        origin: { kind: "task-notification" },
+      });
+      const next = await iter.next();
+      if (next.done) return;
+      yield userEcho(next.value);
+      yield createAssistantError(undefined, "Recovered.");
+      yield successfulResultMessage();
+      await streamGate;
+    }
+    const query = wrapQuery(messages());
+    query.close = () => {
+      producerClosed = true;
+    };
+    const session = mockSessionState({ query, input });
+    agent.sessions["test-session"] = session;
+    expect(
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "work" }] }),
+    ).toMatchObject({ stopReason: "end_turn" });
+    const consumer = session.consumer;
+    try {
+      rejectQuota();
+      await notified;
+      expect(session.lastPublishedGoal.status).toBe("active");
+      expect(producerClosed).toBe(false);
+      const next = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "next" }],
+      });
+      releaseResult();
+      expect(await next).toMatchObject({ stopReason: "end_turn" });
+      expect(session.lastPublishedGoal.status).toBe("limited");
+      expect(producerClosed).toBe(false);
+      expect(agent.sessions["test-session"]).toBe(session);
+      expect(updates.filter((update) => quotaNoticeFor(update))).toHaveLength(1);
+    } finally {
+      rejectQuota();
+      releaseResult();
+      endStream();
+      input.end();
+      await consumer;
+      await agent.dispose();
+    }
   });
 
   it.each([

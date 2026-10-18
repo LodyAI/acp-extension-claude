@@ -44,6 +44,20 @@ acknowledged steering, goals, subagent/background-task lifecycle, and compaction
 ACP-standard elicitation, plans, session forking, and context-window usage remain
 on their standard protocol paths.
 
+For Lody clients, a rejected subscription limit with no available extra usage
+immediately publishes a Core notice, including before the first model reply.
+The SDK query and pending prompts keep their normal lifecycle. A quota failure
+finalizes its own prompt at a native failed result, an unowed idle for the active
+turn, or actual stream end. It does not require a result frame that never arrives.
+Those boundaries mark an active goal `limited`; successful recovery does not turn
+an earlier restriction into a failed turn. Late idles and inputs not yet echoed
+retain their existing ownership guards.
+Terminal errors carry `errorKind: quota_exhausted` and `quotaNoticePublished` so
+the host avoids killing a healthy runtime or duplicating the notice. Actual stream
+end retains the existing stream cleanup. Known reset times are included.
+Quota warnings and available extra usage retain their normal path,
+as do AIR's negotiated typed session failures.
+
 Usage accounting reads SDK query-wide model totals (including subagents) and
 splits available thinking tokens from output. Each SDK result is its own Core
 usage scope (`_meta.lody.usageScopeId` = result uuid) whose `modelUsage` and

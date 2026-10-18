@@ -2,6 +2,7 @@ import type { ClientCapabilities, SessionNotification } from "@agentclientprotoc
 import {
   getSessionMessages,
   type SDKAssistantMessageError,
+  type SDKRateLimitInfo,
   USAGE_LIMIT_ERROR_PREFIXES,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
@@ -11,6 +12,24 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
+
+/** A rejected subscription window is not a block while extra usage is available. */
+export function quotaRejectionMessage(info: SDKRateLimitInfo): string | undefined {
+  if (
+    info.status !== "rejected" ||
+    info.overageStatus === "allowed" ||
+    info.overageStatus === "allowed_warning"
+  ) {
+    return undefined;
+  }
+  const resetsAt =
+    typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt)
+      ? new Date(info.resetsAt * 1_000)
+      : undefined;
+  const reset =
+    resetsAt && Number.isFinite(resetsAt.getTime()) ? ` Resets at ${resetsAt.toISOString()}.` : "";
+  return `Claude account usage limit reached.${reset}`;
+}
 
 export function airSessionFailureCapabilityMeta(...additionalCapabilities: string[]) {
   return airCapabilityMeta(AIR_SESSION_FAILURE_CAPABILITY, ...additionalCapabilities);
