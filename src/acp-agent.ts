@@ -186,6 +186,7 @@ import {
   type ResumedSessionSnapshot,
   type ResumedUsageBaseline,
 } from "./resumed-session.js";
+import { SessionActivityReporter } from "./session-activity.js";
 import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
@@ -504,6 +505,7 @@ export const CLAUDE_LODY_CAPABILITIES = {
   subagentEvents: { version: 1 },
   goal: { version: 1, actions: GOAL_ACTIONS },
   compaction: { version: 1 },
+  sessionActivity: { version: 1 },
 } as const satisfies LodyExtensionCapabilities;
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
@@ -1381,6 +1383,8 @@ export type Session = {
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
+  /** Sends `_lody/session/activity_update` levels; see {@link SessionActivityReporter}. */
+  activityReporter?: SessionActivityReporter;
   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
    *  hand it the retained summary. */
   contextCompaction?: ContextCompactionLifecycle;
@@ -4241,6 +4245,13 @@ export class ClaudeAcpAgent {
       },
     ));
 
+    const activity = (session.activityReporter ??= new SessionActivityReporter(
+      params.sessionId,
+      async (update) =>
+        this.client.extNotification(LODY_EXTENSION_METHODS.sessionActivityUpdate, { ...update }),
+      (message, error) => this.logger.error(message, error),
+    ));
+
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
       airClient: this.toolCallCapabilities.air.client,
@@ -5521,6 +5532,7 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
+                void activity.stateChanged(message.state);
                 if (message.state === "running") session.titles.onRunning(session);
                 sessionIndex.noteSessionState(session, previousState, message.state);
                 if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
@@ -6130,6 +6142,7 @@ export class ClaudeAcpAgent {
                 break;
               case "background_tasks_changed":
                 await asyncTasks.backgroundTasksChanged(message.tasks);
+                void activity.backgroundTasksChanged(message.tasks);
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
                 // reconcile `liveBackgroundTasks` — dropping (or, for
