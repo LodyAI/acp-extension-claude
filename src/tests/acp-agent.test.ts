@@ -18632,6 +18632,76 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("reports activity levels for background shells that outlive the turn", async () => {
+    // A `run_in_background` shell does not hold the prompt open, so the
+    // prompt resolves while the shell runs. The activity level is how the
+    // client learns the session is still waiting on it, and that the model
+    // ran again by itself after the shell finished.
+    const activity: { state: string; backgroundTaskCount: number }[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification: async (method: string, params: Record<string, any>) => {
+        if (method === "_lody/session/activity_update") {
+          expect(params).toMatchObject({ version: 1, sessionId: "test-session" });
+          activity.push({ state: params.state, backgroundTaskCount: params.backgroundTaskCount });
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    let releaseShell!: () => void;
+    const shellGate = new Promise<void>((resolve) => (releaseShell = resolve));
+    const shellLevel = (live: boolean) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [
+        ...(live ? [{ task_id: "shell-1", task_type: "local_bash", description: "build" }] : []),
+        // Ambient tasks are not activity and are never counted.
+        { task_id: "watch-1", task_type: "local_bash", description: "watch", ambient: true },
+      ],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield shellLevel(true);
+        yield resultMessage();
+        yield idle();
+        await shellGate;
+        yield shellLevel(false);
+        yield running();
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "build in the background" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    await waitFor(() => activity.length >= 3);
+    expect(activity).toEqual([
+      { state: "running", backgroundTaskCount: 0 },
+      { state: "running", backgroundTaskCount: 1 },
+      { state: "idle", backgroundTaskCount: 1 },
+    ]);
+
+    releaseShell();
+    await agent.sessions["test-session"]?.consumer;
+    expect(activity.slice(3)).toEqual([
+      { state: "idle", backgroundTaskCount: 0 },
+      { state: "running", backgroundTaskCount: 0 },
+      { state: "idle", backgroundTaskCount: 0 },
+    ]);
+    expect(CLAUDE_LODY_CAPABILITIES.sessionActivity).toEqual({ version: 1 });
+  });
+
   it("keeps holding through a peer-origin autonomous result", async () => {
     // A peer/coordinator cycle's result is not the user's; it must neither
     // settle the held turn as a hand-off nor touch the user-turn lifecycle.
