@@ -7884,8 +7884,15 @@ describe("stop reason propagation", () => {
 
   it("publishes active_goal as provider-neutral session state without changing turn settlement", async () => {
     const updates: any[] = [];
+    // The cleared goal arrives after the result that settles the prompt, so the
+    // turn resolves before it is published; wait for that update, not a timer.
+    let goalCleared!: () => void;
+    const goalClearedSeen = new Promise<void>((resolve) => (goalCleared = resolve));
     const mockClient = {
-      sessionUpdate: async (notification: any) => updates.push(notification),
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+        if (notification.update?._meta?.lody?.goal === null) goalCleared();
+      },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
@@ -7922,6 +7929,7 @@ describe("stop reason propagation", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
     ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await goalClearedSeen;
     expect(coreGoalUpdates(updates)).toContainEqual({
       sessionId: "test-session",
       update: {
