@@ -15022,6 +15022,40 @@ describe("emitRawSDKMessages", () => {
       uuid: randomUUID(),
       session_id: "sdk-session",
     };
+    const bashTaskStarted = {
+      type: "system" as const,
+      subtype: "task_started" as const,
+      task_id: "bash-task-1",
+      task_type: "local_bash",
+      description: "Run a background command",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const bashTaskCompleted = {
+      type: "system" as const,
+      subtype: "task_notification" as const,
+      task_id: "bash-task-1",
+      status: "completed" as const,
+      summary: "Background command completed",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const lateBashProgress = {
+      type: "system" as const,
+      subtype: "task_progress" as const,
+      task_id: "bash-task-1",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
+    const explicitWorkflowTask = {
+      type: "system" as const,
+      subtype: "task_started" as const,
+      task_id: "workflow-task-1",
+      task_type: "local_workflow",
+      description: "Run the workflow",
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+    };
     injectSession(
       agent,
       [
@@ -15029,6 +15063,10 @@ describe("emitRawSDKMessages", () => {
         taskProgress,
         taskUpdated,
         taskNotification,
+        bashTaskStarted,
+        bashTaskCompleted,
+        lateBashProgress,
+        explicitWorkflowTask,
         createResultMessage(),
         { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
@@ -15058,6 +15096,23 @@ describe("emitRawSDKMessages", () => {
       status: "completed",
       summary: "Agent finished",
     });
+    const bashLifecycle = updates.filter(
+      (notification) => notification.update?._meta?.lody?.task?.taskId === "bash-task-1",
+    );
+    expect(bashLifecycle.map((notification) => notification.update.sessionUpdate)).toEqual([
+      "tool_call",
+      "tool_call_update",
+      "tool_call_update",
+    ]);
+    expect(bashLifecycle[0].update._meta.lody.task).toMatchObject({ actor: "local_bash" });
+    expect(bashLifecycle[1].update).toMatchObject({ title: "Claude task" });
+    expect(bashLifecycle[1].update._meta.lody.task).not.toHaveProperty("actor");
+    expect(bashLifecycle[2].update._meta.lody.task).not.toHaveProperty("actor");
+    expect(
+      updates.find(
+        (notification) => notification.update?._meta?.lody?.task?.taskId === "workflow-task-1",
+      )?.update._meta.lody.task,
+    ).toMatchObject({ actor: "local_workflow" });
     expect(extNotifications.filter((n) => n.method === "_claude/sdkMessage")).toHaveLength(0);
   });
 
