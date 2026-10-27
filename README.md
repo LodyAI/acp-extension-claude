@@ -128,6 +128,5 @@ turn, so `sourceTurnId` is omitted. Late/stale suggestions are allowed: the adap
 neither guesses a turn nor filters by the latest prompt. Delivery does not hold
 prompt completion and never becomes assistant text. Silence is not an error.
 
-This integration requires the companion Core workspace change. Before standalone
-release, publish Core and update the pinned dependency; the current published
-Core dependency does not yet provide these types/helpers.
+This integration uses the prompt-suggestion contract from the pinned
+`acp-extension-core@0.3.0` dependency.
