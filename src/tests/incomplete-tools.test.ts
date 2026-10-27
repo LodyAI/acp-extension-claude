@@ -264,6 +264,13 @@ function createTestSession(
     } as unknown as AcpClient,
     { log: () => {}, error: logError },
   );
+  // Every prompt also probes `claude auth status` in the background, and the
+  // test CLI (/usr/bin/false) makes that probe log a failure. It is unrelated
+  // to unfinished tools, so keep it out of the error log these tests count.
+  vi.spyOn(
+    agent as unknown as { runCliAuthProbe: () => Promise<undefined> },
+    "runCliAuthProbe",
+  ).mockResolvedValue(undefined);
   agent.sessions[sessionId] = mockSessionState({
     input,
     // The real consumer reads the scripted SDK events from this generator.
