@@ -285,6 +285,8 @@ import {
 } from "./utils.js";
 import {
   LODY_EXTENSION_METHODS,
+  supportsLodyPromptSuggestions,
+  type LodyPromptSuggestion,
   type LodyExtensionCapabilities,
   type LodySteerResponse,
   type LodyTaskMeta,
@@ -490,6 +492,7 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
 export const CLAUDE_STEER_APPLIED_METHOD = LODY_EXTENSION_METHODS.sessionSteerApplied;
 
 export const CLAUDE_LODY_CAPABILITIES = {
+  promptSuggestions: { version: 1 },
   sessionTitle: { version: 1 },
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
@@ -1030,6 +1033,8 @@ type PendingReplay = {
 };
 
 export type Session = {
+  /** Native query identity can differ after recreating a stable ACP session. */
+  nativeSessionId?: string;
   /** Models whose cost in this query() includes a guessed rate. */
   unknownUsageCostModels?: Set<string>;
   /** Last accounting reading of this query(), seeded with the running total a
@@ -7544,8 +7549,28 @@ export class ClaudeAcpAgent {
             session.titles.reset();
             break;
           }
+          case "prompt_suggestion": {
+            if (
+              supportsLodyPromptSuggestions(this.clientCapabilities) &&
+              message.session_id === (session.nativeSessionId ?? params.sessionId)
+            ) {
+              const update: LodyPromptSuggestion = {
+                sessionId: params.sessionId,
+                suggestionId: message.uuid,
+                result: { type: "completed", text: message.suggestion },
+              };
+              try {
+                await this.client.extNotification(LODY_EXTENSION_METHODS.sessionPromptSuggestion, {
+                  ...update,
+                });
+              } catch {
+                // Suggestions are advisory; a failed delivery must not terminate the query.
+                this.logger.error("Failed to deliver prompt suggestion");
+              }
+            }
+            break;
+          }
           case "tool_use_summary":
-          case "prompt_suggestion":
             break;
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {
@@ -10052,6 +10077,10 @@ export class ClaudeAcpAgent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
+      // Negotiation enables generation while respecting an explicit provider opt-out.
+      ...(supportsLodyPromptSuggestions(this.clientCapabilities)
+        ? { promptSuggestions: userProvidedOptions?.promptSuggestions ?? true }
+        : {}),
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids
       // snapshot I/O for every other session.
@@ -10410,6 +10439,7 @@ export class ClaudeAcpAgent {
       );
 
       this.sessions[sessionId] = {
+        nativeSessionId: options.sessionId ?? creationOpts.resume ?? sessionId,
         query: q,
         input: input,
         cancelled: false,

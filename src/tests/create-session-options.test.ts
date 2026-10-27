@@ -162,6 +162,27 @@ describe("createSession options merging", () => {
     });
   }
 
+  it.each([
+    { version: undefined, explicit: undefined, expected: undefined },
+    { version: 2, explicit: undefined, expected: undefined },
+    { version: 1, explicit: undefined, expected: true },
+    { version: 1, explicit: false, expected: false },
+    { version: 1, explicit: true, expected: true },
+    { version: undefined, explicit: true, expected: true },
+  ])(
+    "negotiates prompt generation without overriding explicit options ($version / $explicit)",
+    async ({ version, explicit, expected }) => {
+      agent.clientCapabilities = { _meta: { lody: { promptSuggestions: { version } } } };
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { promptSuggestions: explicit } } },
+      });
+      expect(capturedOptions?.promptSuggestions).toBe(expected);
+      await agent.closeSession({ sessionId: response.sessionId });
+    },
+  );
+
   describe("allowDangerouslySkipPermissions", () => {
     it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });

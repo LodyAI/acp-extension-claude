@@ -111,3 +111,23 @@ It uses the existing ACP `session/update` callback with `session_info_update` an
 custom names (the SDK combines generated names and user renames), and `fallback`
 for prompt summaries. Hosts can skip their own title process while rejecting
 fallback previews. A change of source is published even when the text is unchanged.
+
+## Prompt suggestions
+
+Both peers opt in using `_meta.lody.promptSuggestions: { version: 1 }`.
+Negotiation enables SDK `promptSuggestions` unless
+`_meta.claudeCode.options.promptSuggestions` is explicitly false. Without
+negotiation, existing provider options remain unchanged and no Core suggestions
+are sent. Native settings, environment and quota suppression still apply.
+
+The long-lived SDK consumer forwards `prompt_suggestion` as
+`_lody/session/prompt_suggestion`, with the owning ACP `sessionId`, SDK `uuid` as
+`suggestionId`, and `{ type: "completed", text: suggestion }`. A recreated query's
+native session ID is mapped back to its ACP owner. The SDK provides no source
+turn, so `sourceTurnId` is omitted. Late/stale suggestions are allowed: the adapter
+neither guesses a turn nor filters by the latest prompt. Delivery does not hold
+prompt completion and never becomes assistant text. Silence is not an error.
+
+This integration requires the companion Core workspace change. Before standalone
+release, publish Core and update the pinned dependency; the current published
+Core dependency does not yet provide these types/helpers.

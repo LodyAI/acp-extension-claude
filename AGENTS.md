@@ -78,3 +78,9 @@ gh pr merge <pr-number> --squash
 The preflight is the guard-list as code; if it exits non-zero, follow what it
 prints rather than merging. Full runbook, including how to recover a stalled
 release: [`docs/RELEASES.md`](docs/RELEASES.md).
+
+## Prompt suggestions
+
+- Gate Core suggestion notifications on the client's `promptSuggestions` v1.
+  Keep them outside assistant content and prompt lifecycle. Preserve native
+  identity; never assign the receiving turn as the suggestion's source.
