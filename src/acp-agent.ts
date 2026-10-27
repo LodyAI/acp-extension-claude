@@ -440,11 +440,11 @@ function createClaudeTaskLifecycleUpdate(
   message: ClaudeTaskLifecycleMessage,
   isSubagent: boolean,
 ): SessionNotification["update"] {
-  const actor =
-    cleanTaskText(
-      message.subagent_type ?? message.workflow_name ?? message.task_type ?? "Claude task",
-      160,
-    ) ?? "Claude task";
+  const actor = cleanTaskText(
+    message.subagent_type ?? message.workflow_name ?? message.task_type,
+    160,
+  );
+  const titleActor = actor ?? "Claude task";
   const description = cleanTaskText(message.description ?? message.prompt);
   const summary = cleanTaskText(message.summary);
   const error = cleanTaskText(message.patch?.error);
@@ -465,7 +465,7 @@ function createClaudeTaskLifecycleUpdate(
     taskId: message.task_id,
     kind: isSubagent ? "subagent" : "background",
     status: claudeTaskStatus(message),
-    actor,
+    ...(actor ? { actor } : {}),
     ...(description ? { description } : {}),
     ...(message.tool_use_id ? { parentToolCallId: message.tool_use_id } : {}),
     ...(summary ? { summary } : {}),
@@ -476,7 +476,7 @@ function createClaudeTaskLifecycleUpdate(
   };
   const update = {
     toolCallId: `task:${message.task_id}`,
-    title: description ? `${actor}: ${cleanTaskText(description, 160)}` : actor,
+    title: description ? `${titleActor}: ${cleanTaskText(description, 160)}` : titleActor,
     kind: "think" as const,
     status: task.status,
     _meta: { lody: { task } },

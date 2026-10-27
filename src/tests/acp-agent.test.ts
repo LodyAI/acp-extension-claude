@@ -15061,7 +15061,13 @@ describe("emitRawSDKMessages", () => {
       kind: "subagent",
       status: "in_progress",
       parentToolCallId: "tool-1",
+      actor: "Explore",
     });
+    expect(taskLifecycle[1].update._meta.lody.task).toMatchObject({ actor: "Explore" });
+    for (const notification of taskLifecycle.slice(2)) {
+      expect(notification.update).toMatchObject({ title: "Claude task" });
+      expect(notification.update._meta.lody.task).not.toHaveProperty("actor");
+    }
     expect(taskLifecycle[3].update._meta.lody.task).toMatchObject({
       status: "completed",
       summary: "Agent finished",
