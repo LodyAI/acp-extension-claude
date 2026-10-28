@@ -24122,3 +24122,124 @@ describe("usage accounting scopes", () => {
     expect(usageUpdates.map((u) => u._meta.lody.usageScopeId)).toEqual(["result-1"]);
   });
 });
+
+describe("Core prompt suggestions", () => {
+  it("does not fail a new prompt when delivery of an older suggestion rejects", async () => {
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async () => {},
+        extNotification: async (method: string) => {
+          if (method === "_lody/session/prompt_suggestion") throw new Error("delivery unavailable");
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    agent.clientCapabilities = { _meta: { lody: { promptSuggestions: { version: 1 } } } };
+    injectGeneratorSession(agent, (input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        for (let turn = 0; turn < 2; turn++) {
+          const user = await iter.next();
+          yield userEcho(user.value);
+          if (turn === 1)
+            yield {
+              type: "prompt_suggestion",
+              session_id: "test-session",
+              uuid: "old-suggestion",
+              suggestion: "previous turn",
+            };
+          yield successfulResultMessage();
+          yield {
+            type: "system",
+            subtype: "session_state_changed",
+            state: "idle",
+            session_id: "test-session",
+            uuid: randomUUID(),
+          };
+        }
+      })(),
+    );
+    for (const text of ["first", "second"]) {
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+    }
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it.each([
+    { version: undefined, nativeSessionId: "test-session" },
+    { version: 2, nativeSessionId: "test-session" },
+    { version: 1, nativeSessionId: "test-session" },
+    { version: 1, nativeSessionId: "native-recreated" },
+  ])(
+    "delivers late suggestions for $version with native session $nativeSessionId",
+    async ({ version, nativeSessionId }) => {
+      const received: Record<string, unknown>[] = [];
+      const client = {
+        sessionUpdate: async () => {},
+        extNotification: async (method: string, params: Record<string, unknown>) => {
+          if (method === "_lody/session/prompt_suggestion") received.push(params);
+        },
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+      agent.clientCapabilities = { _meta: { lody: { promptSuggestions: { version } } } };
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      injectGeneratorSession(
+        agent,
+        (input) =>
+          (async function* () {
+            const iter = input[Symbol.asyncIterator]();
+            const user = await iter.next();
+            yield userEcho(user.value);
+            yield successfulResultMessage();
+            yield {
+              type: "system",
+              subtype: "session_state_changed",
+              state: "idle",
+              session_id: "test-session",
+              uuid: randomUUID(),
+            };
+            await gate;
+            yield {
+              type: "prompt_suggestion",
+              session_id: "foreign",
+              uuid: "foreign-id",
+              suggestion: "wrong session",
+            };
+            yield {
+              type: "prompt_suggestion",
+              session_id: nativeSessionId,
+              uuid: "suggestion-id",
+              suggestion: "  next prompt  ",
+            };
+          })(),
+        { nativeSessionId },
+      );
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+      expect(received).toEqual([]);
+      release();
+      await agent.sessions["test-session"]?.consumer;
+      expect(received).toEqual(
+        version === 1
+          ? [
+              {
+                sessionId: "test-session",
+                suggestionId: "suggestion-id",
+                result: { type: "completed", text: "  next prompt  " },
+              },
+            ]
+          : [],
+      );
+    },
+  );
+});
