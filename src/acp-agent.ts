@@ -1,3 +1,4 @@
+import { discoverGatewayModels } from "./gateway-model-catalog.js";
 import { supportsLodySubagentEvents, LODY_SUBAGENT_EVENT_METHOD } from "acp-extension-core";
 import {
   agent as acpAgent,
@@ -322,6 +323,7 @@ import {
 } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
+  isDeniedModel,
   buildModelConfigOption,
   getAvailableModels,
   MODEL_CONFIG_ID,
@@ -1173,6 +1175,7 @@ export type Session = {
   prePlanMode?: string;
   models: SessionModelState;
   modelInfos: ModelInfo[];
+  gatewayModelCatalog?: boolean;
   /** Prevents the model-specific Auto fallback from spamming the transcript. */
   autoModeFallbackWarningShown?: boolean;
   /** Initial mode fallback is reported after session/new, on the first prompt. */
@@ -8221,7 +8224,7 @@ export class ClaudeAcpAgent {
     // list (which never carries `resolvedModel`) remains as a fallback for
     // resolutions that don't map back onto a selectable option (e.g. a fuzzy
     // hit on an out-of-picker verbatim entry).
-    if (!validValue && params.configId === MODEL_CONFIG_ID) {
+    if (!validValue && params.configId === MODEL_CONFIG_ID && !session.gatewayModelCatalog) {
       const toOptionValue = (resolved: ModelInfo | null) =>
         resolved ? allValues.find((o) => o.value === resolved.value) : undefined;
       validValue = toOptionValue(resolveModelPreference(session.modelInfos, params.value));
@@ -9389,7 +9392,12 @@ export class ClaudeAcpAgent {
         // of the switch (issues #886/#880); a guessed seed is instead refined
         // in the background once the switch is done
         // (`refreshContextWindowInBackground`).
-        const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
+        const seeded = immediateContextWindow(
+          session.providerCacheKey,
+          value,
+          newModelInfo,
+          !session.gatewayModelCatalog,
+        );
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
       }
@@ -9584,7 +9592,9 @@ export class ClaudeAcpAgent {
     // `availableModels` allowlist — in which case we track the raw id: the
     // picker shows no selection, but the model-dependent bookkeeping and any
     // later `setModel` round-trip stay truthful to what the SDK is running.
-    const resolved = resolveModelPreference(session.modelInfos, switchedModel);
+    const resolved = session.gatewayModelCatalog
+      ? session.modelInfos.find((model) => model.value === switchedModel)
+      : resolveModelPreference(session.modelInfos, switchedModel);
     const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
 
@@ -9872,7 +9882,10 @@ export class ClaudeAcpAgent {
 
     const input = new Pushable<SDKUserMessage>();
 
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
     const settingsManager = new SettingsManager(params.cwd, {
+      settingSources: sessionMeta?.claudeCode?.options?.settingSources,
+      managedSettings: sessionMeta?.claudeCode?.options?.managedSettings,
       logger: this.logger,
     });
     await settingsManager.initialize();
@@ -9929,7 +9942,6 @@ export class ClaudeAcpAgent {
     }
 
     // Extract options from _meta if provided
-    const sessionMeta = params._meta as NewSessionMeta | undefined;
     // Bypass is off for root outside a sandbox, when settings disable it (the
     // CLI refuses bypass then too), and hosts may opt a session out. Decided
     // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
@@ -10053,7 +10065,7 @@ export class ClaudeAcpAgent {
         env: { ...baseSettings?.env, ...providerEnv },
       };
     }
-    const env = {
+    const env: Record<string, string | undefined> = {
       ...process.env,
       ...userProvidedOptions?.env,
       // Client-managed LLM routing: `providers/set` config wins, else the
@@ -10304,9 +10316,31 @@ export class ClaudeAcpAgent {
       // values passed to `setModel`, keeping configOptions, the current-model
       // resolver, and the stored modelInfos consistent with what the user
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
-      const settingsAvailableModels = settingsManager.getSettings().availableModels;
-      const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-      const allowedModels = Array.isArray(settingsAvailableModels)
+      const managedModelSettings = settingsManager.getManagedSettings();
+      const gatewayEnv = {
+        ...env,
+        ...settingsManager.getSettings().env,
+        ...configuredSettingsObject?.env,
+        ...providerEnv,
+        ...managedModelSettings.env,
+      };
+      const gatewayCatalog = await discoverGatewayModels(gatewayEnv, abortController.signal);
+      if (gatewayCatalog.status === "unavailable") {
+        this.logger.error(
+          `[session/models] gateway discovery unavailable (${gatewayCatalog.reason}); using SDK models`,
+        );
+      }
+      const gatewayModels = gatewayCatalog.status === "ready" ? gatewayCatalog.models : undefined;
+      const settingsAvailableModels =
+        managedModelSettings.availableModels ??
+        configuredSettingsObject?.availableModels ??
+        settingsManager.getSettings().availableModels;
+      const settingsModelOverrides = {
+        ...settingsManager.getSettings().modelOverrides,
+        ...configuredSettingsObject?.modelOverrides,
+        ...managedModelSettings.modelOverrides,
+      };
+      let allowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
             initializationResult.models,
             settingsAvailableModels,
@@ -10314,6 +10348,35 @@ export class ClaudeAcpAgent {
             settingsManager.getManagedDeniedModels(),
           )
         : initializationResult.models;
+
+      if (gatewayModels) {
+        // Directory identity is authoritative. Settings can restrict it, but must
+        // never synthesize removed gateway entries or copy fuzzy Claude capabilities.
+        const allowedIds = Array.isArray(settingsAvailableModels)
+          ? new Set(
+              applyAvailableModelsAllowlist(
+                gatewayModels,
+                settingsAvailableModels,
+                settingsModelOverrides,
+                settingsManager.getManagedDeniedModels(),
+              ).map((m) => m.value),
+            )
+          : undefined;
+        const defaultModel = initializationResult.models.find((m) => m.value === "default") ?? {
+          value: "default",
+          displayName: "Default",
+          description: "",
+        };
+        allowedModels = [
+          defaultModel,
+          ...gatewayModels.filter(
+            (m) =>
+              m.value !== "default" &&
+              (!allowedIds || allowedIds.has(m.value)) &&
+              !isDeniedModel(m.value, settingsManager.getManagedDeniedModels()),
+          ),
+        ];
+      }
 
       const models = await getAvailableModels(
         q,
@@ -10324,6 +10387,8 @@ export class ClaudeAcpAgent {
         creationOpts.resume !== undefined,
         sessionId,
         await resumedModelHint,
+        gatewayModels !== undefined,
+        userProvidedOptions?.model ?? gatewayEnv.ANTHROPIC_MODEL,
       );
       timing.phase("models");
 
@@ -10336,9 +10401,11 @@ export class ClaudeAcpAgent {
       // unknown — otherwise auto mode would be spuriously clamped and the
       // Fast-mode/Effort options hidden for a model that supports them.
       const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
-      const fallbackModelInfo = allowlistedModelInfo
-        ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+      const fallbackModelInfo =
+        allowlistedModelInfo || gatewayModels
+          ? undefined
+          : (resolveModelPreference(initializationResult.models, models.currentModelId) ??
+            undefined);
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
       // Register the fallback-resolved capabilities under the verbatim live id
       // so every modelInfos consumer (buildConfigOptions' effort lookup, later
@@ -10436,6 +10503,7 @@ export class ClaudeAcpAgent {
         providerCacheKey,
         models.currentModelId,
         allowlistedModelInfo,
+        gatewayModels === undefined,
       );
 
       this.sessions[sessionId] = {
@@ -10462,6 +10530,7 @@ export class ClaudeAcpAgent {
         modes,
         models,
         modelInfos,
+        gatewayModelCatalog: gatewayModels !== undefined,
         autoModeFallbackWarningShown: false,
         autoModeFallbackWarningPending,
         configOptions,
@@ -12305,11 +12374,13 @@ function immediateContextWindow(
   providerCacheKey: string,
   modelId: string,
   modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
+  inferFromName = true,
 ): { size: number; authoritative: boolean } {
   const cached = contextWindowCache.get(
     contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
   );
   if (cached !== undefined) return { size: cached, authoritative: true };
+  if (!inferFromName) return { size: DEFAULT_CONTEXT_WINDOW, authoritative: false };
   return {
     size:
       inferContextWindowFromModel(

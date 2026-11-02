@@ -84,3 +84,10 @@ release: [`docs/RELEASES.md`](docs/RELEASES.md).
 - Gate Core suggestion notifications on the client's `promptSuggestions` v1.
   Keep them outside assistant content and prompt lifecycle. Preserve native
   identity; never assign the receiving turn as the suggestion's source.
+
+## Gateway model catalogs
+
+- Gateway model IDs are opaque and must reach `setModel` without fuzzy alias
+  resolution. A fresh session owns its directory snapshot and HTTP client; never
+  persist catalog credentials or write discovery results into Claude settings.
+  Failed discovery keeps native operation available and remains retryable.

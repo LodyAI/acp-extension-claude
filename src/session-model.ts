@@ -397,8 +397,14 @@ export async function getAvailableModels(
   isResumedSession: boolean,
   sessionId: string,
   resumedModelHint?: string,
+  exactModelIds = false,
+  environmentModel = process.env.ANTHROPIC_MODEL,
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
+  const resolve = (value: string) =>
+    exactModelIds
+      ? (models.find((model) => model.value === value) ?? null)
+      : resolveModelPreference(models, value);
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
@@ -407,14 +413,16 @@ export async function getAvailableModels(
   // 2. settings.model (user configuration)
   // 3. the resumed session's live model (resumed sessions only)
   // 4. models[0] (default first model)
-  if (process.env.ANTHROPIC_MODEL) {
-    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+  if (environmentModel) {
+    const match = resolve(environmentModel);
     if (match) {
       currentModel = match;
-      resolvedFromInput = process.env.ANTHROPIC_MODEL;
+      resolvedFromInput = environmentModel;
     }
   } else if (typeof settings.model === "string") {
-    const match = resolveSettingsModel(models, settings.model, logger);
+    const match = exactModelIds
+      ? resolve(settings.model)
+      : resolveSettingsModel(models, settings.model, logger);
     if (match) {
       currentModel = match;
       resolvedFromInput = settings.model;
@@ -428,7 +436,15 @@ export async function getAvailableModels(
   // SDK is already running this model, and pushing a picker alias back (e.g.
   // "opus[1m]") could change the live model rather than describe it.
   if (resolvedFromInput === undefined && isResumedSession) {
-    currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : currentModel;
+    currentModel = resumedModelHint
+      ? exactModelIds
+        ? (resolve(resumedModelHint) ?? {
+            value: resumedModelHint,
+            displayName: resumedModelHint,
+            description: "",
+          })
+        : matchResumedModel(models, resumedModelHint)
+      : currentModel;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
