@@ -7,6 +7,7 @@ const usesRealCli =
 export default defineConfig({
   test: {
     watch: false,
+    setupFiles: usesRealCli ? [] : ["src/tests/network-setup.ts"],
     globals: true,
     environment: "node",
     // The agent runs `claude auth status` in the background on every

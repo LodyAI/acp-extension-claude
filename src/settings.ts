@@ -6,6 +6,7 @@ import {
   filterEscalatingDefaultMode,
   resolveSettings,
   type Settings,
+  type ResolveSettingsOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { claudeConfigDir } from "./paths.js";
 
@@ -33,6 +34,8 @@ function getManagedSettingsPath(): string {
 }
 
 export interface SettingsManagerOptions {
+  settingSources?: ResolveSettingsOptions["settingSources"];
+  managedSettings?: Settings;
   onChange?: () => void;
   logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void };
 }
@@ -48,8 +51,10 @@ export interface SettingsManagerOptions {
  */
 export class SettingsManager {
   private cwd: string;
+  private resolveOptions: ResolveSettingsOptions;
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
+  private managedSettings: Settings = {};
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -60,6 +65,11 @@ export class SettingsManager {
 
   constructor(cwd: string, options?: SettingsManagerOptions) {
     this.cwd = cwd;
+    this.resolveOptions = {
+      cwd,
+      settingSources: options?.settingSources,
+      managedSettings: options?.managedSettings,
+    };
     this.onChange = options?.onChange;
     this.logger = options?.logger ?? console;
   }
@@ -105,8 +115,18 @@ export class SettingsManager {
    */
   private async loadAllSettings(): Promise<void> {
     try {
-      const resolved = await resolveSettings({ cwd: this.cwd });
+      const resolved = await resolveSettings(this.resolveOptions);
       this.effective = filterEscalatingDefaultMode(resolved);
+      this.managedSettings = resolved.sources
+        .filter((entry) => entry.source === "managed")
+        .reduce<Settings>(
+          (settings, entry) => ({
+            ...settings,
+            ...entry.settings,
+            env: { ...settings.env, ...entry.settings.env },
+          }),
+          {},
+        );
       // The CLI reads `deniedModels` from managed settings only.
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
@@ -115,6 +135,7 @@ export class SettingsManager {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
+      this.managedSettings = {};
     }
   }
 
@@ -181,6 +202,10 @@ export class SettingsManager {
    * `deniedModels` entries from the managed tier, the only tier the CLI
    * honors them from.
    */
+  getManagedSettings(): Settings {
+    return this.managedSettings;
+  }
+
   getManagedDeniedModels(): string[] {
     return this.managedDeniedModels;
   }
@@ -202,6 +227,7 @@ export class SettingsManager {
 
     this.dispose();
     this.cwd = cwd;
+    this.resolveOptions = { ...this.resolveOptions, cwd };
     await this.initialize();
   }
 

@@ -7,6 +7,7 @@ import {
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { fetch as gatewayFetch } from "undici";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -118,6 +119,182 @@ describe("createSession options merging", () => {
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  it("discovers a fresh gateway catalog and selects exact IDs without Claude capabilities", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-models-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", home);
+    const ids = ["codex/gpt-test", "auto/claude-sonnet-test"];
+    vi.mocked(gatewayFetch).mockImplementation(
+      async () => new Response(JSON.stringify({ data: ids.map((id) => ({ id })) })) as never,
+    );
+    const params = {
+      cwd: home,
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            env: {
+              ANTHROPIC_BASE_URL: "https://gateway.example/prefix",
+              ANTHROPIC_AUTH_TOKEN: "synthetic-token",
+            },
+          },
+        },
+      },
+    };
+    try {
+      const first = await agent.newSession(params);
+      const option = first.configOptions?.find((o) => o.id === "model");
+      expect(option?.type === "select" && option.options).toEqual(
+        expect.arrayContaining(ids.map((value) => expect.objectContaining({ value }))),
+      );
+      let selected: string | undefined;
+      setModelImpl = async (model) => {
+        selected = model;
+      };
+      const switched = await agent.setSessionConfigOption({
+        sessionId: first.sessionId,
+        configId: "model",
+        value: "auto/claude-sonnet-test",
+      });
+      expect(selected).toBe("auto/claude-sonnet-test");
+      expect(switched.configOptions.some((o) => o.id === "effort")).toBe(false);
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: first.sessionId,
+          configId: "model",
+          value: "auto/claude-sonnet-typo",
+        }),
+      ).rejects.toThrow();
+      ids.splice(0, ids.length, "devin/new-model");
+      const second = await agent.newSession(params);
+      const updated = second.configOptions?.find((o) => o.id === "model");
+      expect(updated?.type === "select" && updated.options).toEqual(
+        expect.arrayContaining([expect.objectContaining({ value: "devin/new-model" })]),
+      );
+      expect(JSON.stringify(updated)).not.toContain("codex/gpt-test");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.mocked(gatewayFetch).mockReset();
+      vi.mocked(gatewayFetch).mockRejectedValue(new Error("Network disabled in tests"));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses session settings routing and limits without inventing stale catalog entries", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-settings-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", home);
+    vi.mocked(gatewayFetch).mockImplementation(async (url, options) => {
+      const auth = new Headers(options?.headers as Record<string, string>).get("authorization");
+      return new Response(
+        JSON.stringify(
+          String(url) === "https://session.example/v1/models" && auth === "Bearer session-token"
+            ? { data: [{ id: "vendor/current" }, { id: "vendor/excluded" }] }
+            : { error: "wrong route" },
+        ),
+        { status: auth === "Bearer session-token" ? 200 : 401 },
+      ) as never;
+    });
+    try {
+      const result = await agent.newSession({
+        cwd: home,
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              env: {
+                ANTHROPIC_BASE_URL: "https://wrong.example",
+                ANTHROPIC_AUTH_TOKEN: "wrong-token",
+              },
+              settings: {
+                env: {
+                  ANTHROPIC_BASE_URL: "https://session.example",
+                  ANTHROPIC_AUTH_TOKEN: "session-token",
+                },
+                availableModels: ["vendor/current", "vendor/removed"],
+              },
+            },
+          },
+        },
+      });
+      const model = result.configOptions?.find((o) => o.id === "model");
+      expect(model?.type === "select" && model.options).toEqual([
+        expect.objectContaining({ value: "default" }),
+        expect.objectContaining({ value: "vendor/current" }),
+      ]);
+      vi.mocked(gatewayFetch).mockRejectedValue(new Error("upstream secret"));
+      const fallback = await agent.newSession({
+        cwd: home,
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              env: { ANTHROPIC_BASE_URL: "https://unavailable.example" },
+            },
+          },
+        },
+      });
+      const fallbackModel = fallback.configOptions?.find((o) => o.id === "model");
+      expect(fallbackModel?.type === "select" && fallbackModel.options).toEqual([
+        expect.objectContaining({ value: "claude-sonnet-4-6" }),
+      ]);
+    } finally {
+      await agent.dispose();
+      vi.unstubAllEnvs();
+      vi.mocked(gatewayFetch).mockReset();
+      vi.mocked(gatewayFetch).mockRejectedValue(new Error("Network disabled in tests"));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not discover through settings sources the session disabled", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-sources-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", home);
+    fs.writeFileSync(
+      path.join(home, "settings.json"),
+      JSON.stringify({
+        env: { ANTHROPIC_BASE_URL: "https://disabled.example", ANTHROPIC_AUTH_TOKEN: "disabled" },
+      }),
+    );
+    vi.mocked(gatewayFetch).mockImplementation(
+      async (url) =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id:
+                  String(url) === "https://selected.example/v1/models"
+                    ? "selected/model"
+                    : "wrong/model",
+              },
+            ],
+          }),
+        ) as never,
+    );
+    try {
+      const result = await agent.newSession({
+        cwd: home,
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              settingSources: [],
+              env: { ANTHROPIC_BASE_URL: "https://selected.example" },
+            },
+          },
+        },
+      });
+      const model = result.configOptions?.find((o) => o.id === "model");
+      expect(model?.type === "select" && model.options).toEqual(
+        expect.arrayContaining([expect.objectContaining({ value: "selected/model" })]),
+      );
+    } finally {
+      await agent.dispose();
+      vi.unstubAllEnvs();
+      vi.mocked(gatewayFetch).mockReset();
+      vi.mocked(gatewayFetch).mockRejectedValue(new Error("Network disabled in tests"));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   for (const method of ["resumeSession", "loadSession"] as const) {

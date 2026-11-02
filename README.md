@@ -27,6 +27,46 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
+## Anthropic-compatible gateway models
+
+When a session has a custom `ANTHROPIC_BASE_URL`, the adapter discovers its model
+catalog during session creation. It requests `<base>/v1/models` (without doubling
+an existing `/v1`), preserves path prefixes, and follows Anthropic `has_more` /
+`last_id` pagination using `after_id`. OpenAI-shaped `{ "data": [{ "id": "vendor/model" }] }`
+lists also work; `display_name` is optional. No settings file is written.
+
+The ACP model selector contains the freshly discovered IDs plus the SDK's Default
+entry. Exact IDs are passed to Claude Code without alias or family matching.
+Effective `availableModels` and managed `deniedModels` still restrict selection;
+old allowlist entries do not create rows absent from the gateway. Remove obsolete
+restrictions only if you intend to change that policy. A successful empty catalog
+leaves Default, while a failed discovery falls back to the existing SDK/settings
+list and emits a content-free stderr diagnostic.
+
+Discovery uses session environment and enabled settings sources, including
+programmatic and managed settings. `ANTHROPIC_AUTH_TOKEN` uses Bearer authentication;
+otherwise `ANTHROPIC_API_KEY` uses `x-api-key`. `ANTHROPIC_CUSTOM_HEADERS` is supported.
+Subscription OAuth tokens and `apiKeyHelper` are not used by the catalog client.
+HTTP(S) proxy variables, both `NO_PROXY` spellings, `NODE_EXTRA_CA_CERTS`, and
+`CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY` / `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`
+are applied to a session-owned HTTP client. Redirects are rejected. Discovery is
+bounded to five seconds, 2 MiB, 4096 unique models and 32 pages; cancellation releases
+the client. Native Anthropic, Bedrock, Vertex and Foundry retain SDK discovery.
+Set `CLAUDE_ACP_MODEL_DISCOVERY=off` to disable the gateway request.
+
+There is no cross-session catalog cache. A client capability refresh that creates
+a new adapter session fetches again; an already running session keeps its snapshot.
+A client serving its own cached capabilities does not invoke the adapter.
+Directory entries alone do not establish effort, Fast, Auto-mode, image or Messages
+compatibility. The adapter does not borrow Claude family capabilities for these
+entries; the gateway must support Claude Code's Messages requests and tool protocol.
+
+For a local build, run `npm ci`, `npm run build`, then configure an ACP client to
+launch `node /absolute/path/to/acp-extension-claude/dist/index.js`, with the gateway
+URL/token in that Agent's environment. Use Node 22.19+ (or a supported newer LTS).
+This runs the local adapter without changing the client's bundled adapter or the
+user's Claude settings. Credentials must not be placed in command-line arguments.
+
 ## Lody extensions
 
 With bilateral `_meta.lody.subagentEvents: { version: 1 }`, native subagent
