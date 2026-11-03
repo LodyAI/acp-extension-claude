@@ -1,3 +1,5 @@
+import { LODY_EXTENSION_METHODS } from "acp-extension-core";
+import { parseSessionIdRequest } from "../session-index/service.js";
 /**
  * The experimental draft ACP v2 surface of the adapter.
  *
@@ -74,6 +76,16 @@ export function v2AgentApp(
         ...(await setupCommands(agent, response.sessionId, logger)),
       };
     })
+    .onRequest(
+      LODY_EXTENSION_METHODS.sessionArchive,
+      { parse: parseSessionIdRequest },
+      ({ params }) => agent.setLodySessionArchived(params.sessionId, true),
+    )
+    .onRequest(
+      LODY_EXTENSION_METHODS.sessionUnarchive,
+      { parse: parseSessionIdRequest },
+      ({ params }) => agent.setLodySessionArchived(params.sessionId, false),
+    )
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
     .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
       const restore = v1RestoreSessionRequest(params);

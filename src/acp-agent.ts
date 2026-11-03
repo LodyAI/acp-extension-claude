@@ -511,6 +511,7 @@ export const CLAUDE_LODY_CAPABILITIES = {
   goal: { version: 1, actions: GOAL_ACTIONS },
   compaction: { version: 1 },
   sessionActivity: { version: 1 },
+  sessionArchive: { version: 1, mode: "title-marker" },
 } as const satisfies LodyExtensionCapabilities;
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
@@ -3161,6 +3162,10 @@ export class ClaudeAcpAgent {
   renameSessionTitle(params: RenameSessionRequest) {
     return this.sessionIndex.rename(params);
   }
+  setLodySessionArchived(sessionId: string, archived: boolean) {
+    return this.sessionIndex.setLodyArchived(sessionId, archived);
+  }
+
   archiveSession(params: SessionIdRequest) {
     return this.sessionIndex.archive(params);
   }
@@ -12221,6 +12226,16 @@ export function v1AgentApp(
     .onRequest(methods.agent.providers.set, (ctx) => agent.unstable_setProvider(ctx.params))
     .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
+    .onRequest(
+      LODY_EXTENSION_METHODS.sessionArchive,
+      { parse: sessionIndex.parseSessionIdRequest },
+      (ctx) => agent.setLodySessionArchived(ctx.params.sessionId, true),
+    )
+    .onRequest(
+      LODY_EXTENSION_METHODS.sessionUnarchive,
+      { parse: sessionIndex.parseSessionIdRequest },
+      (ctx) => agent.setLodySessionArchived(ctx.params.sessionId, false),
+    )
     .onRequest<RateLimitsGetRequest, RateLimitsGetResponse>(
       LODY_EXTENSION_METHODS.rateLimitsGet,
       parseRateLimitsGetRequest,
