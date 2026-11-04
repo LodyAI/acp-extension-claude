@@ -652,6 +652,56 @@ describe("session/list of a sessionIndex client", () => {
   });
 });
 
+describe("Core archive without AIR negotiation", () => {
+  it.each([false, true])("marks and restores stored titles with v2=%s", async (v2) => {
+    const transcript = await writeTranscript({ trailer: [] });
+    const { agent } = createAgent({ v2 });
+    const initialized = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    expect(initialized.agentCapabilities?._meta).toMatchObject({
+      lody: { sessionArchive: { version: 1, mode: "title-marker" } },
+    });
+    await agent.setLodySessionArchived(transcript.id, true);
+    await agent.setLodySessionArchived(transcript.id, true);
+    const archived = await fs.readFile(transcript.file, "utf8");
+    expect(archived).toContain("[archived]");
+    expect(archived).not.toContain("[archived] [archived]");
+    // Plain clients still see this session: a marker does not imply native hiding.
+    expect(
+      (await agent.listSessions({ cwd: workspace })).sessions.map((row) => row.sessionId),
+    ).toContain(transcript.id);
+    await agent.setLodySessionArchived(transcript.id, false);
+    expect((await getSessionInfo(transcript.id))?.customTitle).not.toContain("[archived]");
+    expect((await fs.readFile(transcript.file, "utf8")).split('"type":"user"')).toHaveLength(2);
+    await agent.dispose();
+  });
+
+  it("refuses an open runtime and preserves its transcript", async () => {
+    const transcript = await writeTranscript({});
+    const { agent } = createAgent();
+    await initializeClient(agent, {});
+    const active = runningSession({}, agent, transcript.id);
+    agent.sessions[transcript.id] = active;
+    const before = await fs.readFile(transcript.file, "utf8");
+    for (const archived of [true, false]) {
+      await expect(agent.setLodySessionArchived(transcript.id, archived)).rejects.toMatchObject({
+        code: -32600,
+      });
+    }
+    expect(agent.sessions[transcript.id]).toBe(active);
+    expect(await fs.readFile(transcript.file, "utf8")).toBe(before);
+    await agent.dispose();
+  });
+
+  it("rejects a missing transcript rather than creating history", async () => {
+    const { agent } = createAgent();
+    await initializeClient(agent, {});
+    await expect(agent.setLodySessionArchived(randomUUID(), true)).rejects.toMatchObject({
+      code: -32002,
+    });
+    await agent.dispose();
+  });
+});
+
 describe("old session/list path", () => {
   it("calls the SDK exactly as before for a client without sessionIndex", async () => {
     const session = await writeTranscript({});

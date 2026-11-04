@@ -229,6 +229,18 @@ export class SessionIndexConnection {
     return {};
   }
 
+  /** Core marks native titles only. It never opts a client into the AIR index. */
+  async setLodyArchived(sessionId: string, archived: boolean): Promise<EmptyResponse> {
+    if (this.host.agent.sessions[sessionId] !== undefined) {
+      throw RequestError.invalidRequest(
+        { sessionId },
+        "Close the session before archiving or restoring it",
+      );
+    }
+    await this.archiveWriter().retitle(sessionId, archiveTo(archived), { sidecar: "existing" });
+    return {};
+  }
+
   /** `_session/archive`: hides a session from the default list and stops
    *  it. Idempotent; the session need not be loaded. A session loaded here
    *  is interrupted, retitled through its CLI while that still runs, then
@@ -348,14 +360,14 @@ export class SessionIndexConnection {
     if (this.service) {
       await this.service.delete(params.sessionId, loaded);
     } else if (this.host.isAirClient()) {
-      await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
+      await archiveInsteadOfDelete(params.sessionId, this.archiveWriter());
     } else {
       await sdkDeleteSession(params.sessionId);
     }
     return {};
   }
 
-  private airArchiver(): SessionIndexService {
+  private archiveWriter(): SessionIndexService {
     this.archiver ??= new SessionIndexService({
       logError: (message, error) =>
         this.host.agent.logger.error(`[session-index] ${message}:`, error),
@@ -457,3 +469,5 @@ export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexM
       (ctx) => agent().unarchiveSession(ctx.params),
     );
 }
+
+export { parseSessionIdRequest } from "./service.js";

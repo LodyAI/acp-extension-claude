@@ -1,3 +1,4 @@
+import { CLAUDE_LODY_CAPABILITIES } from "../acp-agent.js";
 /**
  * The ACP v2 `initialize` handshake, expressed through the v1 handshake of
  * `ClaudeAcpAgent`.
@@ -63,7 +64,10 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
   if (!response.agentInfo) {
     throw new Error("ACP v2 requires agentInfo, and the agent reported none");
   }
-  const meta = withoutLodyCapabilities(response.agentCapabilities?._meta);
+  const meta = {
+    ...withoutLodyCapabilities(response.agentCapabilities?._meta),
+    lody: { sessionArchive: CLAUDE_LODY_CAPABILITIES.sessionArchive },
+  };
   const topMeta = Object.fromEntries(
     Object.entries(response._meta ?? {}).filter(([key]) => !UNSERVED_EXTENSION_KEYS.includes(key)),
   );

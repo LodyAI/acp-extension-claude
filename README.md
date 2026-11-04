@@ -169,4 +169,13 @@ neither guesses a turn nor filters by the latest prompt. Delivery does not hold
 prompt completion and never becomes assistant text. Silence is not an error.
 
 This integration uses the prompt-suggestion contract from the pinned
-`acp-extension-core@0.3.0` dependency.
+Core dependency (temporarily pinned to the upstream LodyAI archive contract commit until its release).
+
+## Lody session archive
+
+Core `sessionArchive` v1 advertises `mode: "title-marker"` in both ACP versions.
+`_lody/session/archive` and `_lody/session/unarchive` reuse the AIR-compatible
+title writer without requiring AIR negotiation, loading a session, or a model
+turn. Callers must first close the runtime. The operations are idempotent and
+preserve transcripts, but Claude Code's resume picker can still show the marked
+session. This is not a native hidden-history archive.

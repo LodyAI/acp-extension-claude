@@ -1,3 +1,4 @@
+import { LODY_EXTENSION_METHODS } from "acp-extension-core";
 /**
  * The experimental draft ACP v2 surface, driven through the protocol router
  * with the SDK's own v1 and v2 client apps. The v2 client app validates every
@@ -260,6 +261,33 @@ describe("ACP protocol routing", () => {
     }
   });
 
+  it("routes Core archive requests on both protocol versions without loading a session", async () => {
+    await v1
+      .client({ name: "archive-v1" })
+      .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+        await agent.request(v1.methods.agent.initialize, {
+          protocolVersion: 1,
+          clientCapabilities: {},
+        });
+        await expect(
+          agent.request(LODY_EXTENSION_METHODS.sessionArchive, { sessionId: randomUUID() }),
+        ).rejects.toMatchObject({ code: -32002 });
+        await expect(
+          agent.request(LODY_EXTENSION_METHODS.sessionUnarchive, { sessionId: randomUUID() }),
+        ).rejects.toMatchObject({ code: -32002 });
+      });
+    await v2Client().app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(
+        agent.request(LODY_EXTENSION_METHODS.sessionArchive, { sessionId: randomUUID() }),
+      ).rejects.toMatchObject({ code: -32002 });
+      await expect(
+        agent.request(LODY_EXTENSION_METHODS.sessionUnarchive, { sessionId: randomUUID() }),
+      ).rejects.toMatchObject({ code: -32002 });
+    });
+    expect(sdk.queryOptions).toEqual([]);
+  });
+
   it("serves the v2 handshake to a v2 client", async () => {
     const { app, authUpdate } = v2Client();
     const response = await app.connectWith(connectRouter(), async (agent) => {
@@ -290,7 +318,9 @@ describe("ACP protocol routing", () => {
     expect(response.capabilities?.providers).toEqual({});
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
     expect(response._meta?.steering).toBeUndefined();
-    expect(response.capabilities?._meta).not.toHaveProperty("lody");
+    expect(response.capabilities?._meta).toMatchObject({
+      lody: { sessionArchive: { version: 1, mode: "title-marker" } },
+    });
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
       expect(method).not.toHaveProperty("id");

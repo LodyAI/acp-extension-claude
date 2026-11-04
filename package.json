@@ -56,7 +56,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "1.8.0",
     "@anthropic-ai/claude-agent-sdk": "0.3.316",
-    "acp-extension-core": "0.3.0",
+    "acp-extension-core": "git+https://github.com/LodyAI/acp-extension-core.git#8d3ee102b7b33be809674886eafe11e83cefb095",
     "diff": "9.0.0",
     "undici": "8.12.3",
     "zod": "4.6.5"
