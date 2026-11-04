@@ -169,7 +169,7 @@ neither guesses a turn nor filters by the latest prompt. Delivery does not hold
 prompt completion and never becomes assistant text. Silence is not an error.
 
 This integration uses the prompt-suggestion contract from the pinned
-Core dependency (temporarily pinned to the companion archive contract commit until its release).
+Core dependency (temporarily pinned to the upstream LodyAI archive contract commit until its release).
 
 ## Lody session archive
 
