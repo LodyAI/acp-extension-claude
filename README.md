@@ -170,3 +170,31 @@ prompt completion and never becomes assistant text. Silence is not an error.
 
 This integration uses the prompt-suggestion contract from the pinned
 `acp-extension-core@0.3.0` dependency.
+
+## Client system prompts
+
+The adapter advertises `sessionCapabilities.systemPrompt.mode.override` and accepts
+standard ACP `systemPrompt` on `session/new`, `session/load`, `session/resume`, and
+`session/fork`:
+
+```json
+{
+  "systemPrompt": {
+    "mode": "append",
+    "content": [{ "type": "text", "text": "Use the project's terminology." }]
+  }
+}
+```
+
+`append` adds instructions to the native prompt; `override` replaces its base
+instructions. Content must contain at least one text block; unsupported modes or
+content return `invalidParams` (-32602). These instructions do not change tool
+permissions or remove required runtime context. They apply to the requested
+session, not sibling sessions. Pass them again when reconnecting or forking to
+ensure the same instructions are used.
+
+Standard `systemPrompt` takes precedence over legacy `_meta.systemPrompt` and
+`_meta.claudeCode.options.systemPrompt`. Append retains the Claude Code preset and
+AIR instructions. Changing the value on an idle load/resume rebuilds the native
+query; a busy session rejects the change. Omitting it uses the normal legacy/default
+configuration. Existing conversation history is unchanged.

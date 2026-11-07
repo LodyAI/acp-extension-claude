@@ -1,3 +1,4 @@
+import { readClientSystemPrompt } from "./client-system-prompt.js";
 import { discoverGatewayModels } from "./gateway-model-catalog.js";
 import { supportsLodySubagentEvents, LODY_SUBAGENT_EVENT_METHOD } from "acp-extension-core";
 import {
@@ -1662,6 +1663,7 @@ function canonicalJson(value: unknown): unknown {
 export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  systemPrompt?: NewSessionRequest["systemPrompt"];
   additionalDirectories?: NewSessionRequest["additionalDirectories"];
   _meta?: NewSessionRequest["_meta"];
 }): string {
@@ -1679,6 +1681,7 @@ export function computeSessionFingerprint(params: {
       mcpServers: servers,
       additionalDirectories: params.additionalDirectories,
       additionalRoots: meta?.additionalRoots,
+      clientSystemPrompt: params.systemPrompt,
       systemPrompt: meta?.systemPrompt,
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
@@ -2897,6 +2900,7 @@ export class ClaudeAcpAgent {
 
     const sessionCapabilities: SubagentAwareSessionCapabilities = {
       additionalDirectories: {},
+      systemPrompt: { mode: { override: {} } },
       close: {},
       delete: {},
       fork: {},
@@ -2989,6 +2993,7 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponseWithAvailableCommands> {
+    readClientSystemPrompt(params.systemPrompt);
     if (this.providerUpdate) await this.providerUpdate;
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
@@ -3033,6 +3038,7 @@ export class ClaudeAcpAgent {
           cwd: params.cwd,
           mcpServers: params.mcpServers ?? [],
           additionalDirectories: params.additionalDirectories,
+          systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
         {
@@ -3057,6 +3063,7 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    readClientSystemPrompt(params.systemPrompt);
     if (this.providerUpdate) await this.providerUpdate;
     const forkTurnId = getLodyForkTurnId(params._meta);
     if (forkTurnId) {
@@ -3065,6 +3072,7 @@ export class ClaudeAcpAgent {
           cwd: params.cwd,
           mcpServers: params.mcpServers ?? [],
           additionalDirectories: params.additionalDirectories,
+          systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
         {
@@ -3079,13 +3087,18 @@ export class ClaudeAcpAgent {
       }, 0);
       return response;
     }
-    return forkSession(params, {
+    const forked = await forkSession(params, {
       logger: this.logger,
       messageIdForGrouping,
     });
+    if (params.systemPrompt != null) {
+      await this.getOrCreateSession({ ...params, sessionId: forked.sessionId });
+    }
+    return forked;
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    readClientSystemPrompt(params.systemPrompt);
     if (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
@@ -3094,6 +3107,7 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    readClientSystemPrompt(params.systemPrompt);
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
     let result: NewSessionResponse;
@@ -9723,6 +9737,7 @@ export class ClaudeAcpAgent {
       sessionId: string;
       cwd: string;
       mcpServers?: NewSessionRequest["mcpServers"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
       additionalDirectories?: NewSessionRequest["additionalDirectories"];
       _meta?: NewSessionRequest["_meta"];
     },
@@ -9745,6 +9760,16 @@ export class ClaudeAcpAgent {
       // MCP servers reconfigured, or the skill set changed). Tear down the
       // existing session and recreate it so the underlying Query process picks
       // up the new values.
+      if (
+        JSON.stringify(params.systemPrompt ?? null) !==
+          JSON.stringify(existingSession.creationParams?.systemPrompt ?? null) &&
+        (existingSession.activeTurn || existingSession.turnQueue?.length)
+      ) {
+        throw RequestError.invalidParams(
+          undefined,
+          "Changing systemPrompt requires an idle session",
+        );
+      }
       await this.teardownSession(params.sessionId);
     }
 
@@ -9753,6 +9778,7 @@ export class ClaudeAcpAgent {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
         additionalDirectories: params.additionalDirectories,
+        systemPrompt: params.systemPrompt,
         _meta: params._meta,
       },
       {
@@ -9829,6 +9855,7 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
     } = {},
   ): Promise<NewSessionResponse> {
+    const clientPrompt = readClientSystemPrompt(params.systemPrompt);
     const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -10089,6 +10116,20 @@ export class ClaudeAcpAgent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
+      ...(clientPrompt
+        ? {
+            systemPrompt:
+              clientPrompt.mode === "override"
+                ? clientPrompt.text
+                : {
+                    type: "preset" as const,
+                    preset: "claude_code" as const,
+                    append: [customInstructions, clientPrompt.text]
+                      .filter((part) => part !== undefined)
+                      .join("\n\n"),
+                  },
+          }
+        : {}),
       // Negotiation enables generation while respecting an explicit provider opt-out.
       ...(supportsLodyPromptSuggestions(this.clientCapabilities)
         ? { promptSuggestions: userProvidedOptions?.promptSuggestions ?? true }

@@ -97,6 +97,7 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
  *   v1 baseline; v2 has no SSE transport.
  */
 const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
+  systemPrompt: { mode: { override: {} } },
   prompt: { image: {}, embeddedContext: {} },
   mcp: { stdio: {}, http: {} },
   delete: {},

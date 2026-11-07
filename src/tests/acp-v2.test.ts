@@ -232,6 +232,58 @@ async function initializeV2(agent: v2.ClientContext, capabilities: v2.ClientCapa
 }
 
 describe("ACP protocol routing", () => {
+  it("passes standard system prompts through both protocol versions", async () => {
+    let authUpdated!: () => void;
+    const authUpdate = new Promise<void>((resolve) => (authUpdated = resolve));
+    await v1
+      .client({ name: "prompt-client" })
+      .onNotification(
+        "_auth/status_update",
+        (params) => params,
+        () => authUpdated(),
+      )
+      .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+        const init = await agent.request(v1.methods.agent.initialize, {
+          protocolVersion: v1.PROTOCOL_VERSION,
+          clientCapabilities: {},
+        });
+        await authUpdate;
+        expect(init.agentCapabilities?.sessionCapabilities?.systemPrompt?.mode?.override).toEqual(
+          {},
+        );
+        const session = await agent.request(v1.methods.agent.session.new, {
+          cwd,
+          mcpServers: [],
+          systemPrompt: { mode: "append", content: [{ type: "text", text: "V1 instructions" }] },
+        });
+        expect(sdk.queryOptions.at(-1)?.systemPrompt).toMatchObject({ append: "V1 instructions" });
+        await agent.request(v1.methods.agent.session.resume, {
+          cwd,
+          sessionId: session.sessionId,
+          systemPrompt: { mode: "override", content: [{ type: "text", text: "V1 replacement" }] },
+        });
+        expect(sdk.queryOptions.at(-1)?.systemPrompt).toBe("V1 replacement");
+        await agents.at(-1)!.dispose();
+      });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await client.authUpdate(1);
+      const session = await agent.request(v2.methods.agent.session.new, {
+        cwd,
+        systemPrompt: { mode: "append", content: [{ type: "text", text: "V2 instructions" }] },
+      });
+      expect(sdk.queryOptions.at(-1)?.systemPrompt).toMatchObject({ append: "V2 instructions" });
+      await agent.request(v2.methods.agent.session.resume, {
+        cwd,
+        sessionId: session.sessionId,
+        systemPrompt: { mode: "override", content: [{ type: "text", text: "V2 replacement" }] },
+      });
+      expect(sdk.queryOptions.at(-1)?.systemPrompt).toBe("V2 replacement");
+      await agents.at(-1)!.dispose();
+    });
+  });
+
   it("serves the unchanged v1 handshake to a v1 client", async () => {
     let authUpdated!: () => void;
     const authUpdate = new Promise<void>((resolve) => (authUpdated = resolve));
@@ -286,6 +338,7 @@ describe("ACP protocol routing", () => {
       delete: {},
       fork: {},
       additionalDirectories: {},
+      systemPrompt: { mode: { override: {} } },
     });
     expect(response.capabilities?.providers).toEqual({});
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.

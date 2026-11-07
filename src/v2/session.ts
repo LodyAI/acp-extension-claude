@@ -1,3 +1,4 @@
+import { readClientSystemPrompt } from "../client-system-prompt.js";
 /**
  * The ACP v2 session lifecycle, expressed through the v1 session methods of
  * `ClaudeAcpAgent`: v2 requests become the v1 requests that the agent serves,
@@ -21,9 +22,13 @@ import {
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
-  const { mcpServers, ...request } = params;
+  const { mcpServers, systemPrompt, ...request } = params;
   // v1 requires the list; v2 treats an omitted list as an empty one.
-  return { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) };
+  return {
+    ...request,
+    systemPrompt: v1SystemPrompt(systemPrompt),
+    mcpServers: (mcpServers ?? []).map(v1McpServer),
+  };
 }
 
 /**
@@ -40,11 +45,15 @@ export function v1RestoreSessionRequest(
 ):
   | { method: "resume"; request: ResumeSessionRequest }
   | { method: "load"; request: LoadSessionRequest } {
-  const { replayFrom, mcpServers, ...request } = params;
+  const { replayFrom, mcpServers, systemPrompt, ...request } = params;
   if (replayFrom == null) {
     return {
       method: "resume",
-      request: { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) },
+      request: {
+        ...request,
+        systemPrompt: v1SystemPrompt(systemPrompt),
+        ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
+      },
     };
   }
   if (replayFrom.type !== "start") {
@@ -55,7 +64,11 @@ export function v1RestoreSessionRequest(
   }
   return {
     method: "load",
-    request: { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) },
+    request: {
+      ...request,
+      systemPrompt: v1SystemPrompt(systemPrompt),
+      mcpServers: (mcpServers ?? []).map(v1McpServer),
+    },
   };
 }
 
@@ -73,9 +86,10 @@ export function v1ForkSessionRequests(params: v2.ForkSessionRequest): {
   fork: ForkSessionRequest;
   resume: (sessionId: string) => ResumeSessionRequest;
 } {
-  const { mcpServers, _meta, ...request } = params;
+  const { mcpServers, _meta, systemPrompt, ...request } = params;
   const session = {
     ...request,
+    systemPrompt: v1SystemPrompt(systemPrompt),
     ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
   };
   return {
@@ -173,4 +187,9 @@ function v1McpServer(server: v2.McpServer): McpServer {
     { type: server.type },
     `MCP servers of type ${server.type} are not supported`,
   );
+}
+
+function v1SystemPrompt(value: unknown): NewSessionRequest["systemPrompt"] {
+  const prompt = readClientSystemPrompt(value);
+  return prompt ? { mode: prompt.mode, content: [{ type: "text", text: prompt.text }] } : undefined;
 }
