@@ -678,6 +678,60 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("standard ACP systemPrompt", () => {
+    it("appends client text to native instructions on new and replaces it on resume", async () => {
+      const first = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "append", content: [{ type: "text", text: "First" }] },
+      });
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "First",
+      });
+      await agent.resumeSession({
+        sessionId: first.sessionId,
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "append", content: [{ type: "text", text: "Second" }] },
+      });
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Second",
+      });
+    });
+
+    it("overrides the native preset and takes precedence over legacy metadata", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        systemPrompt: { mode: "override", content: [{ type: "text", text: "Replacement" }] },
+        _meta: { systemPrompt: "Legacy" },
+      });
+      expect(capturedOptions!.systemPrompt).toBe("Replacement");
+    });
+
+    it.each([
+      { mode: "unknown", content: [{ type: "text", text: "Invalid" }] },
+      { mode: "append", content: [] },
+      { mode: "append", content: [{ type: "image", data: "invalid" }] },
+    ])("rejects unsupported instructions before replacing a live query", async (systemPrompt) => {
+      const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const original = agent.sessions[first.sessionId];
+      await expect(
+        agent.resumeSession({
+          sessionId: first.sessionId,
+          cwd: process.cwd(),
+          mcpServers: [],
+          systemPrompt,
+        } as Parameters<typeof agent.resumeSession>[0]),
+      ).rejects.toMatchObject({ code: -32602 });
+      expect(agent.sessions[first.sessionId]).toBe(original);
+    });
+  });
+
   describe("systemPrompt via _meta", () => {
     it("defaults to the claude_code preset when not provided", async () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });

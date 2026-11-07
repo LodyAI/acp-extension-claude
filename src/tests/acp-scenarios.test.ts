@@ -132,6 +132,11 @@ function upstreamComparable(records: Recorded[]): Recorded[] {
         }
         const meta = clean(rest);
         if (Object.keys(meta).length) result[key] = meta;
+      } else if (key === "sessionCapabilities") {
+        // Standard systemPrompt support is an intentional addition to the upstream baseline.
+        const capabilities = { ...(item as Record<string, unknown>) };
+        delete capabilities.systemPrompt;
+        result[key] = clean(capabilities);
       } else if (key === "agentInfo") {
         result[key] = { ...clean(item), name: "@agentclientprotocol/claude-agent-acp" };
       } else result[key] = clean(item);

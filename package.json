@@ -54,7 +54,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.8.0",
+    "@agentclientprotocol/sdk": "1.9.0",
     "@anthropic-ai/claude-agent-sdk": "0.3.316",
     "acp-extension-core": "0.3.0",
     "diff": "9.0.0",

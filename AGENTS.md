@@ -91,3 +91,5 @@ release: [`docs/RELEASES.md`](docs/RELEASES.md).
   resolution. A fresh session owns its directory snapshot and HTTP client; never
   persist catalog credentials or write discovery results into Claude settings.
   Failed discovery keeps native operation available and remains retryable.
+
+- Standard ACP `systemPrompt` takes precedence over legacy prompt metadata, is validated before session mutation, and stays in the activation fingerprint. Apply it to native query options, never a user message.
