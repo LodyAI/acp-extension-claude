@@ -5,7 +5,7 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { fetch as gatewayFetch } from "undici";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
@@ -23,6 +23,8 @@ let initModels: Record<string, unknown>[] | undefined;
 let initGate: Promise<void> | undefined;
 let initError: Error | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
+let applyFlagSettingsImpl:
+  ((settings: Parameters<Query["applyFlagSettings"]>[0]) => Promise<void>) | undefined;
 let interruptImpl: (() => Promise<undefined>) | undefined;
 let closeSpy: ReturnType<typeof vi.fn<() => void>>;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
@@ -48,6 +50,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           if (initError) throw initError;
           return initializationResponse();
         },
+        applyFlagSettings: (settings: Parameters<Query["applyFlagSettings"]>[0]) =>
+          applyFlagSettingsImpl ? applyFlagSettingsImpl(settings) : Promise.resolve(),
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
         getContextUsage: (opts?: { detail?: "summary" | "full" }) => {
           contextUsageCalls.push(opts);
@@ -106,6 +110,7 @@ describe("createSession options merging", () => {
     initGate = undefined;
     initError = undefined;
     setModelImpl = undefined;
+    applyFlagSettingsImpl = undefined;
     interruptImpl = undefined;
     closeSpy = vi.fn<() => void>();
     mcpServerStatusResult = async () => [];
@@ -180,6 +185,105 @@ describe("createSession options merging", () => {
       fs.rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it.each([false, true])(
+    "exposes and applies gateway effort, including explicit Provider overrides (%s)",
+    async (override) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-effort-"));
+      vi.stubEnv("CLAUDE_CONFIG_DIR", home);
+      const id = "vendor/reasoner";
+      vi.mocked(gatewayFetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id,
+                ...(!override && {
+                  supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
+                }),
+              },
+              { id: "unknown" },
+            ],
+          }),
+        ) as never,
+      );
+      let backendEffort: unknown;
+      let rejectEffort = false;
+      applyFlagSettingsImpl = async (settings) => {
+        if (rejectEffort && settings.effortLevel === "low")
+          throw new Error("Backend rejected effort");
+        backendEffort = settings.effortLevel;
+      };
+      try {
+        const first = await agent.newSession({
+          cwd: home,
+          mcpServers: [],
+          _meta: {
+            claudeCode: {
+              options: {
+                env: {
+                  ANTHROPIC_BASE_URL: "https://gateway.example",
+                  ...(override && {
+                    CLAUDE_ACP_MODEL_EFFORTS: JSON.stringify({ [id]: ["low", "high"] }),
+                  }),
+                },
+              },
+            },
+          },
+        });
+        const switched = await agent.setSessionConfigOption({
+          sessionId: first.sessionId,
+          configId: "model",
+          value: id,
+        });
+        const effort = switched.configOptions.find((o) => o.id === "effort");
+        expect(effort?.type === "select" && effort.options).toEqual([
+          { value: "default", name: "Default" },
+          { value: "low", name: "Low" },
+          { value: "high", name: "High" },
+        ]);
+        const applied = await agent.setSessionConfigOption({
+          sessionId: first.sessionId,
+          configId: "effort",
+          value: "high",
+        });
+        expect(backendEffort).toBe("high");
+        expect(applied.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+        rejectEffort = true;
+        await expect(
+          agent.setSessionConfigOption({
+            sessionId: first.sessionId,
+            configId: "effort",
+            value: "low",
+          }),
+        ).rejects.toThrow("Backend rejected effort");
+        expect(backendEffort).toBe("high");
+        expect(applied.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+        expect(
+          agent.sessions[first.sessionId].configOptions.find((o) => o.id === "effort")
+            ?.currentValue,
+        ).toBe("high");
+        rejectEffort = false;
+        const unknown = await agent.setSessionConfigOption({
+          sessionId: first.sessionId,
+          configId: "model",
+          value: "unknown",
+        });
+        expect(unknown.configOptions.some((o) => o.id === "effort")).toBe(false);
+        const back = await agent.setSessionConfigOption({
+          sessionId: first.sessionId,
+          configId: "model",
+          value: id,
+        });
+        expect(back.configOptions.some((o) => o.id === "effort")).toBe(true);
+      } finally {
+        vi.unstubAllEnvs();
+        vi.mocked(gatewayFetch).mockReset();
+        vi.mocked(gatewayFetch).mockRejectedValue(new Error("Network disabled in tests"));
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("uses session settings routing and limits without inventing stale catalog entries", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-settings-"));

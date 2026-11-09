@@ -54,6 +54,30 @@ bounded to five seconds, 2 MiB, 4096 unique models and 32 pages; cancellation re
 the client. Native Anthropic, Bedrock, Vertex and Foundry retain SDK discovery.
 Set `CLAUDE_ACP_MODEL_DISCOVERY=off` to disable the gateway request.
 
+Gateway entries may declare `supported_reasoning_levels: [{ "effort": "low" },
+{ "effort": "high" }]`. The adapter exposes those effort choices for any model ID,
+limited to levels accepted by the pinned Claude SDK: `low`, `medium`, `high`,
+`xhigh`, and `max`. Other levels are not translated into a different effort.
+Missing or malformed capability metadata leaves effort unknown and does not remove
+the model. Effort metadata does not enable Fast mode, Auto mode, or adaptive thinking.
+
+To supply or override effort choices for a gateway model, set
+`CLAUDE_ACP_MODEL_EFFORTS` in the Provider environment (or Claude settings `env`)
+to a JSON object, for example:
+
+```json
+{ "vendor/model-a": ["low", "medium", "high"], "vendor/model-b": [] }
+```
+
+Overrides take precedence over gateway declarations and match exact model IDs.
+An empty array disables the effort selector for that model. They do not add absent
+models, bypass model allowlists/managed denials, or change native/disabled discovery.
+Invalid overrides fail session creation with a configuration error. The effective
+session environment and settings precedence also apply to this variable. Refresh
+Provider capabilities and start a new session after changing it; existing sessions
+retain their catalog snapshot. SDK/backend rejections propagate without changing
+the selected effort to a value that failed to apply.
+
 There is no cross-session catalog cache. A client capability refresh that creates
 a new adapter session fetches again; an already running session keeps its snapshot.
 A client serving its own cached capabilities does not invoke the adapter.

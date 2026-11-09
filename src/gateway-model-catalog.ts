@@ -2,7 +2,18 @@ import { readFile } from "node:fs/promises";
 import { getCACertificates } from "node:tls";
 import { EnvHttpProxyAgent, fetch } from "undici";
 import { z } from "zod";
-import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { EffortLevel, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+
+// These are the levels accepted by the pinned Claude SDK, regardless of model brand.
+const effortLevelSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+const effortOverridesSchema = z.record(
+  z
+    .string()
+    .min(1)
+    .max(512)
+    .regex(/^[^\s\p{Cc}]+$/u),
+  z.array(effortLevelSchema).max(5),
+);
 
 const entrySchema = z.object({
   id: z
@@ -11,6 +22,11 @@ const entrySchema = z.object({
     .max(512)
     .regex(/^[^\s\p{Cc}]+$/u),
   display_name: z.string().max(512).optional(),
+  supported_reasoning_levels: z
+    .array(z.object({ effort: z.string().max(64) }))
+    .max(64)
+    .optional()
+    .catch(undefined),
 });
 const pageSchema = z.object({
   data: z.array(entrySchema).max(4096),
@@ -31,12 +47,25 @@ export async function discoverGatewayModels(
   const base = env.ANTHROPIC_BASE_URL;
   if (
     !base ||
+    (URL.canParse(base) && new URL(base).hostname === "api.anthropic.com") ||
     env.CLAUDE_ACP_MODEL_DISCOVERY === "off" ||
     ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"].some(
       (key) => env[key] === "1" || env[key] === "true",
     )
   )
     return { status: "disabled" };
+
+  let effortOverrides: Record<string, EffortLevel[]> = {};
+  if (env.CLAUDE_ACP_MODEL_EFFORTS !== undefined) {
+    try {
+      if (env.CLAUDE_ACP_MODEL_EFFORTS.length > 256 * 1024) throw new Error();
+      effortOverrides = effortOverridesSchema.parse(JSON.parse(env.CLAUDE_ACP_MODEL_EFFORTS));
+    } catch {
+      throw new Error(
+        "Invalid CLAUDE_ACP_MODEL_EFFORTS: expected model IDs mapped to SDK effort arrays",
+      );
+    }
+  }
 
   let dispatcher: EnvHttpProxyAgent | undefined;
   const controller = new AbortController();
@@ -45,7 +74,6 @@ export async function discoverGatewayModels(
   try {
     signal.throwIfAborted();
     const url = new URL(base);
-    if (url.hostname === "api.anthropic.com") return { status: "disabled" };
     if (
       !["http:", "https:"].includes(url.protocol) ||
       url.username ||
@@ -124,12 +152,23 @@ export async function discoverGatewayModels(
       }
       const page = pageSchema.parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       for (const entry of page.data) {
+        const declaredLevels = entry.supported_reasoning_levels?.flatMap(({ effort }) => {
+          const parsed = effortLevelSchema.safeParse(effort);
+          return parsed.success ? [parsed.data] : [];
+        });
+        const levels = Object.hasOwn(effortOverrides, entry.id)
+          ? effortOverrides[entry.id]
+          : declaredLevels;
         models.set(entry.id, {
           value: entry.id,
           displayName: entry.display_name || entry.id,
           description: "",
-          // A directory entry does not prove Claude SDK feature compatibility.
-          supportsEffort: false,
+          // Missing metadata stays unknown; explicit overrides can also disable effort with [].
+          ...(levels !== undefined && {
+            supportsEffort: levels.length > 0,
+            supportedEffortLevels: [...new Set(levels)],
+          }),
+          // Effort metadata does not establish other Claude SDK capabilities.
           supportsFastMode: false,
           supportsAutoMode: false,
           supportsAdaptiveThinking: false,
