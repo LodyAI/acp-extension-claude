@@ -692,6 +692,16 @@ describe("Core archive without AIR negotiation", () => {
     await agent.dispose();
   });
 
+  it("orders a Core archive after an AIR rename already in flight", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    const rename = agent.renameSessionTitle({ sessionId: session.id, title: "Renamed" });
+    const archive = agent.setLodySessionArchived(session.id, true);
+    await Promise.all([rename, archive]);
+    expect((await getSessionInfo(session.id))?.customTitle).toBe("[archived] Renamed");
+    await agent.dispose();
+  });
+
   it("rejects a missing transcript rather than creating history", async () => {
     const { agent } = createAgent();
     await initializeClient(agent, {});

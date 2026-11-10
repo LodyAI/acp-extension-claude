@@ -367,7 +367,9 @@ export class SessionIndexConnection {
     return {};
   }
 
+  /** The negotiated index when present, so Core archives share its per-session mutation queue. */
   private archiveWriter(): SessionIndexService {
+    if (this.service) return this.service;
     this.archiver ??= new SessionIndexService({
       logError: (message, error) =>
         this.host.agent.logger.error(`[session-index] ${message}:`, error),
