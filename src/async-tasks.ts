@@ -1,4 +1,5 @@
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import { randomUUID } from "node:crypto";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
 import { noticeOrTranscriptUpdate } from "./session-notices.js";
@@ -14,6 +15,8 @@ type AsyncTask = {
   taskType: string;
   description: string;
   showInTranscript: boolean;
+  /** A Monitor tool call or an SDK `local_monitor` task: published as a monitor the client cannot stop. */
+  monitor: boolean;
   outputFilePath?: string;
   toolCallId?: string;
   /**
@@ -39,6 +42,12 @@ type AsyncTask = {
   terminalSource?: TerminalSource;
   /** The optional fields that the client holds now, as JSON. */
   published: Map<string, string>;
+  /**
+   * Whether the task stands for a model turn that Claude Code started on its
+   * own, see {@link AsyncTaskRuntime.autonomousTurnStarted}. The SDK knows no
+   * such task, so its background task list never ends it.
+   */
+  autonomousTurn: boolean;
 };
 
 type TaskIdentity = { taskId?: unknown; task_id?: unknown };
@@ -96,6 +105,28 @@ type TaskProgress = TaskIdentity & {
   output_file?: unknown;
 };
 
+/** The display fields of a task progress report, shared by AIR and v2 cards. */
+export type TaskProgressFields = {
+  description?: string;
+  summary?: string;
+  lastToolName?: string;
+  usage?: { totalTokens: number; toolUses: number; durationMs: number };
+};
+
+/** Reads the display fields supplied by a task progress report. */
+export function taskProgressFields(message: TaskProgress): TaskProgressFields {
+  const usage = taskUsage(message.usage);
+  const description = nonBlankString(message.description);
+  const summary = nonBlankString(message.summary);
+  const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
+  return {
+    ...(description ? { description } : {}),
+    ...(summary ? { summary } : {}),
+    ...(lastToolName ? { lastToolName } : {}),
+    ...(usage ? { usage } : {}),
+  };
+}
+
 type BackgroundTaskLevel = TaskIdentity & {
   taskType?: unknown;
   task_type?: unknown;
@@ -121,6 +152,10 @@ export class AsyncTaskRuntime {
    * The oldest entries are dropped.
    */
   private readonly outputPathsByToolCall = new Map<string, string[]>();
+  /** The task of the autonomous turn that runs now. */
+  private autonomousTurn?: AsyncTask;
+  /** The summary of the last task notification, which usually starts the next autonomous turn. */
+  private lastNotificationSummary?: string;
 
   constructor(
     readonly enabled: boolean,
@@ -131,7 +166,8 @@ export class AsyncTaskRuntime {
      *  the tasks that a tool call in another session started, for example in
      *  a native subagent session. `toolNameOf`: the name of the tool of a tool
      *  call, or `undefined` when the tool call is unknown. A task that a
-     *  `Monitor` tool call started is ignored. */
+     *  `Monitor` tool call started is published as a monitor: the SDK reports
+     *  it as `local_bash`, so the adapter names it a monitor. */
     private readonly options: {
       notices?: boolean;
       routeOf?: (toolCallId: string) => Route | undefined;
@@ -144,7 +180,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message)) {
       this.ignore(task);
       return;
     }
@@ -175,7 +211,7 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.task(taskId);
-    if (isSubagentTask(message) || isMonitorTask(message)) {
+    if (isSubagentTask(message)) {
       this.ignore(task);
       return;
     }
@@ -253,15 +289,8 @@ export class AsyncTaskRuntime {
       return;
     }
 
-    const usage = taskUsage(message.usage);
-    const description = nonBlankString(message.description);
-    const summary = nonBlankString(message.summary);
-    const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
     const progress = {
-      ...(description ? { description } : {}),
-      ...(summary ? { summary } : {}),
-      ...(lastToolName ? { lastToolName } : {}),
-      ...(usage ? { usage } : {}),
+      ...taskProgressFields(message),
       ...(outputChanged && task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId !== previousToolCallId && task.toolCallId
         ? { toolCallId: task.toolCallId }
@@ -300,6 +329,7 @@ export class AsyncTaskRuntime {
     const state = taskState(message.status);
     if (!taskId || !state || state === "running" || state === "paused") return;
 
+    this.lastNotificationSummary = nonBlankString(message.summary) ?? this.lastNotificationSummary;
     const task = this.task(taskId);
     const wasTerminal = isTerminal(task.state);
     const correctsLevelState = wasTerminal && task.terminalSource === "level";
@@ -343,7 +373,7 @@ export class AsyncTaskRuntime {
       const task = this.task(taskId);
       if (task.ignored || isTerminal(task.state)) continue;
       const levelTaskType = field(item, "taskType", "task_type");
-      if (levelTaskType === "local_agent" || levelTaskType === "local_monitor") {
+      if (levelTaskType === "local_agent") {
         this.ignore(task);
         continue;
       }
@@ -363,6 +393,7 @@ export class AsyncTaskRuntime {
       if (
         (task.announced || task.held) &&
         !task.ignored &&
+        !task.autonomousTurn &&
         !isTerminal(task.state) &&
         !live.has(task.id)
       ) {
@@ -378,6 +409,7 @@ export class AsyncTaskRuntime {
   }
 
   async finishAll(state: Extract<AsyncTaskState, "failed" | "stopped">): Promise<void> {
+    this.autonomousTurn = undefined;
     const errors: unknown[] = [];
     for (const task of this.tasks.values()) {
       if ((task.announced || task.held) && !task.ignored && !isTerminal(task.state)) {
@@ -394,7 +426,13 @@ export class AsyncTaskRuntime {
 
   canStop(taskId: string): boolean {
     const task = this.tasks.get(taskId);
-    return task?.announced === true && !task.ignored && !task.stopping && !isTerminal(task.state);
+    return (
+      task?.announced === true &&
+      !task.monitor &&
+      !task.ignored &&
+      !task.stopping &&
+      !isTerminal(task.state)
+    );
   }
 
   claimStop(taskId: string): boolean {
@@ -412,6 +450,7 @@ export class AsyncTaskRuntime {
     const task = this.tasks.get(taskId);
     if (!task || !task.announced || task.ignored || task.stopAnnounced) return;
     task.stopAnnounced = true;
+    if (this.autonomousTurn === task) this.autonomousTurn = undefined;
     // No terminal summary: a stopped task leaves the Async Tasks panel at once,
     // so anything said there is said to nobody.
     await this.finish(task, "stopped", undefined, "event");
@@ -436,6 +475,54 @@ export class AsyncTaskRuntime {
         this.options.notices ?? false,
       ),
     );
+  }
+
+  /**
+   * Publishes a model turn that Claude Code started with no prompt open, for
+   * example to answer a task notification. ACP v1 has no session state, and
+   * the client already got the stop reason of its last prompt, so this task is
+   * the only sign that the agent works. The tool calls of the turn are in the
+   * transcript already, so the task is not shown there.
+   *
+   * [cause] names what started the turn when Claude Code says so, for example
+   * "A scheduled wakeup fired." It replaces the description of a task that is
+   * already open; without it, an open task is left as it is.
+   */
+  async autonomousTurnStarted(cause?: string): Promise<void> {
+    if (!this.enabled) return;
+    if (this.autonomousTurn) {
+      if (cause) await this.publishProgress(this.autonomousTurn, { description: cause });
+      return;
+    }
+    const task = this.task(`autonomous-turn-${randomUUID()}`);
+    task.autonomousTurn = true;
+    task.startedObserved = true;
+    task.name = "Claude is working";
+    task.taskType = "turn";
+    task.description =
+      cause ?? this.lastNotificationSummary ?? "Claude Code started a turn without a prompt.";
+    task.showInTranscript = false;
+    this.lastNotificationSummary = undefined;
+    this.autonomousTurn = task;
+    await this.announce(task, { withoutToolCall: true });
+  }
+
+  /** Whether the task of an autonomous turn is open. */
+  get autonomousTurnOpen(): boolean {
+    return this.autonomousTurn !== undefined;
+  }
+
+  /** Ends the task of the autonomous turn that runs now, if there is one. */
+  async autonomousTurnEnded(state: "completed" | "failed"): Promise<void> {
+    const task = this.autonomousTurn;
+    if (!task) return;
+    this.autonomousTurn = undefined;
+    await this.finish(task, state, undefined, "event");
+  }
+
+  /** Whether the task stands for an autonomous turn, which a stop interrupts. */
+  isAutonomousTurn(taskId: string): boolean {
+    return this.tasks.get(taskId)?.autonomousTurn === true;
   }
 
   /** Whether a task of the tool call went to the background, so the client gets it. */
@@ -488,6 +575,8 @@ export class AsyncTaskRuntime {
   clear(): void {
     this.tasks.clear();
     this.outputPathsByToolCall.clear();
+    this.autonomousTurn = undefined;
+    this.lastNotificationSummary = undefined;
   }
 
   /**
@@ -510,6 +599,7 @@ export class AsyncTaskRuntime {
       taskType: "task",
       description: "Background task",
       showInTranscript: true,
+      monitor: false,
       announced: false,
       held: false,
       deferred: [],
@@ -520,6 +610,7 @@ export class AsyncTaskRuntime {
       stopAnnounced: false,
       state: "running",
       published: new Map(),
+      autonomousTurn: false,
     };
     this.tasks.set(taskId, task);
     return task;
@@ -529,6 +620,7 @@ export class AsyncTaskRuntime {
     task.startedObserved = true;
     const rawTaskType = field(message, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(message.description);
     if (description) task.description = description;
     else if (task.description === "Background task")
@@ -586,6 +678,7 @@ export class AsyncTaskRuntime {
   private mergeLevel(task: AsyncTask, level: BackgroundTaskLevel): void {
     const rawTaskType = field(level, "taskType", "task_type");
     if (rawTaskType !== undefined) task.taskType = friendlyTaskType(rawTaskType);
+    if (rawTaskType === "local_monitor") task.monitor = true;
     const description = nonBlankString(level.description);
     if (description) {
       task.description = description;
@@ -610,24 +703,28 @@ export class AsyncTaskRuntime {
    * ends first, or when the prompt result ends the model turn
    * ({@link releaseHeld}). No guess by the command text binds a task.
    *
-   * A task that a `Monitor` tool call started is ignored: Monitor streams its
-   * output to the model only, so the task has nothing for the client. The
-   * tool_use streams before the tool runs, so the tool name is known when the
-   * spawn has the tool call id.
+   * A task that a `Monitor` tool call started is published as a monitor. The
+   * SDK reports it as `local_bash`, so the adapter names it a monitor instead of
+   * a shell. It has no transcript card because Monitor streams its output to
+   * the model only, and no Stop because stopping it only ends the agent's wait
+   * (the agent's own TaskStop still works). The tool_use streams before the
+   * tool runs, so the tool name is known when the spawn has the tool call id.
    */
   private async announce(
     task: AsyncTask,
     options: { withoutToolCall?: boolean } = {},
   ): Promise<void> {
     if (task.announced || task.ignored) return;
-    const toolName = task.toolCallId ? this.options.toolNameOf?.(task.toolCallId) : undefined;
-    if (toolName !== undefined && HIDDEN_TASK_TOOLS.has(toolName)) {
-      this.ignore(task);
-      return;
-    }
     if (!task.toolCallId && !options.withoutToolCall && !isTerminal(task.state)) {
       task.held = true;
       return;
+    }
+    if (task.toolCallId && this.options.toolNameOf?.(task.toolCallId) === "Monitor") {
+      task.monitor = true;
+    }
+    if (task.monitor) {
+      task.taskType = "monitor";
+      task.showInTranscript = false;
     }
     if (task.toolCallId) task.route ??= this.options.routeOf?.(task.toolCallId);
     await this.send(task, {
@@ -637,7 +734,7 @@ export class AsyncTaskRuntime {
       taskType: task.taskType,
       description: task.description,
       showInTranscript: task.showInTranscript,
-      canStop: true,
+      canStop: !task.monitor,
       ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
     });
@@ -781,18 +878,29 @@ function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void
  * Recovers a background Bash task from the structured `backgroundTaskId` of
  * its tool result. The text of a tool result never gives a task id: a
  * foreground command can print any text.
+ *
+ * Claude Code sends no `tool_use_result` with a subagent's tool results. For
+ * those, `startedTaskOf` gives the background `local_bash` task whose
+ * `task_started` named the Bash call, which comes before the result.
  */
 export function backgroundBashTaskFromToolResult(
   content: unknown,
   toolUseResult: unknown,
   toolUses: Record<string, { name: string; input: unknown }>,
-): AsyncTaskStarted | undefined {
+  startedTaskOf?: (toolUseId: string) => string | undefined,
+): (AsyncTaskStarted & { taskId: string; toolCallId: string }) | undefined {
   if (!Array.isArray(content)) return undefined;
   const toolResults = content.flatMap(toolResultBlock);
   const bashResults = toolResults.filter((result) => toolUses[result.toolUseId]?.name === "Bash");
   if (bashResults.length === 0) return undefined;
 
-  const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
+  let backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
+  if (backgroundResults.length === 0 && startedTaskOf) {
+    backgroundResults = bashResults.flatMap((result) => {
+      const taskId = result.isError ? undefined : startedTaskOf(result.toolUseId);
+      return taskId ? [{ taskId, toolUseId: result.toolUseId }] : [];
+    });
+  }
   const distinctTaskIds = new Set(backgroundResults.map((result) => result.taskId));
   if (distinctTaskIds.size !== 1) return undefined;
   const taskId = [...distinctTaskIds][0];
@@ -983,13 +1091,6 @@ function isBackgroundTask(isBackgrounded: unknown, taskType: unknown): boolean {
   if (isBackgrounded === true) return true;
   if (isBackgrounded === false) return false;
   return taskType !== "local_bash" && taskType !== "local_agent";
-}
-
-/** The tools whose async tasks the client never sees. */
-const HIDDEN_TASK_TOOLS = new Set(["Monitor"]);
-
-function isMonitorTask(message: AsyncTaskStarted): boolean {
-  return field(message, "taskType", "task_type") === "local_monitor";
 }
 
 function isSubagentTask(message: AsyncTaskStarted): boolean {

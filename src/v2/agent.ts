@@ -11,17 +11,19 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  McpServer,
   RequestPermissionResponse,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
+import { stateUpdate, V2Background } from "./background.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
-import { v2Prompt } from "./prompt.js";
+import { v2Foreground, v2Prompt } from "./prompt.js";
 import {
-  v1ForkSessionRequests,
+  v1ForkSessionRequest,
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
@@ -30,8 +32,10 @@ import {
   v2NewSessionResponse,
   v2ResumeSessionResponse,
 } from "./session.js";
-import { v2SessionUpdate } from "./session-update.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
+import { V2ToolCallMeta } from "./tool-call-meta.js";
+import { v2RestartedToolCall } from "./tool-call.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -52,7 +56,21 @@ export function v2AgentApp(
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger, { v2: true });
+      agent = new ClaudeAcpAgent(client, logger, {
+        v2: true,
+        foreground: (sessionId) =>
+          v2Foreground((update) => {
+            void client.send({ sessionId, update });
+          }),
+        background: {
+          changed: (report) => {
+            for (const notification of client.background.changed(report)) {
+              void client.send(notification);
+            }
+          },
+          forget: (sessionId) => client.background.forget(sessionId),
+        },
+      });
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
@@ -68,11 +86,11 @@ export function v2AgentApp(
       agent.unstable_disableProvider(params),
     )
     .onRequest(v2.methods.agent.session.new, async ({ params }) => {
-      const response = await agent.newSession(v1NewSessionRequest(params));
-      return {
-        ...v2NewSessionResponse(response),
-        ...(await setupCommands(agent, response.sessionId, logger)),
-      };
+      const request = v1NewSessionRequest(params);
+      const response = await agent.newSession(request);
+      const commands = await setupCommands(agent, response.sessionId, logger);
+      afterSetupResponse(agent, response.sessionId, request.mcpServers, commands, logger);
+      return { ...v2NewSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
     .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
@@ -81,23 +99,61 @@ export function v2AgentApp(
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
-      return {
-        ...v2ResumeSessionResponse(response),
-        ...(await setupCommands(agent, params.sessionId, logger)),
-      };
+      // v2 asks for the current title and `updatedAt` after the replay and
+      // before the response, also without a replay, as the client may hold
+      // none or stale ones.
+      await agent.publishCurrentSessionInfo(params.sessionId);
+      // v2 requires a snapshot of the foreground state after the replay and
+      // before the response, also without a replay: a resumed live session can
+      // be running a turn, or waiting on a permission request. The current
+      // state of each subagent, terminal and tool call it lists comes first,
+      // as v2 requires. The subagents' go again after the response (see below).
+      await agent.publishLiveSubagents(
+        params.sessionId,
+        client.background.listedSubagents(params.sessionId),
+      );
+      await agent.publishBackgroundToolCalls(
+        params.sessionId,
+        client.background.listedToolCalls(params.sessionId),
+      );
+      for (const notification of client.background.currentItems(params.sessionId)) {
+        void client.send(notification);
+      }
+      void client.send({
+        sessionId: params.sessionId,
+        update: stateUpdate(agent.foregroundState(params.sessionId)),
+      });
+      const commands = await setupCommands(agent, params.sessionId, logger);
+      // The response ends a replay. The subagents RFD treats the replayed
+      // subagent states before it as history, so their current states follow it.
+      afterSetupResponse(
+        agent,
+        params.sessionId,
+        restore.request.mcpServers ?? [],
+        commands,
+        logger,
+        () => void agent.publishCurrentSubagentStates(params.sessionId),
+      );
+      return { ...v2ResumeSessionResponse(response), ...commands };
     })
-    .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
-      const requests = v1ForkSessionRequests(params);
-      const { sessionId } = await agent.unstable_forkSession(requests.fork);
-      return {
-        sessionId,
-        ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
-        ...(await setupCommands(agent, sessionId, logger)),
-      };
-    })
+    .onRequest(v2.methods.agent.session.fork, ({ params }) =>
+      agent.forking(params.sessionId, async () => {
+        // The agent starts the forked session, so the client can prompt it.
+        const request = v1ForkSessionRequest(params);
+        const response = await agent.unstable_forkSession(request);
+        const commands = await setupCommands(agent, response.sessionId, logger);
+        afterSetupResponse(agent, response.sessionId, request.mcpServers ?? [], commands, logger);
+        return {
+          sessionId: response.sessionId,
+          ...v2ResumeSessionResponse(response),
+          ...commands,
+        };
+      }),
+    )
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
       client.terminals.forget(params.sessionId);
+      client.toolCallMeta.forget(params.sessionId);
       return response;
     })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -105,36 +161,86 @@ export function v2AgentApp(
       const { configOptions, ...response } = await agent.setSessionConfigOption(
         v1SetSessionConfigOptionRequest(params),
       );
-      return { ...response, configOptions: v2ConfigOptions(configOptions) };
+      // v2 asks for a `config_option_update` on every config change, also one
+      // that a client requested, so other attached clients see it. It goes
+      // before the response, as v2 asks of this duplicate. The agent sends v1
+      // clients none: they read the change from the response only.
+      const options = v2ConfigOptions(configOptions);
+      void client.send({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: options },
+      });
+      return { ...response, configOptions: options };
     })
     .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
       v2Prompt(agent, params, (update) => {
         void client.send({ sessionId: params.sessionId, update });
       }),
     )
+    .onRequest(v2.methods.agent.terminal.cancel, async ({ params }) => {
+      await agent.cancelBackgroundTerminal(params);
+      return {};
+    })
+    .onRequest(v2.methods.agent.toolCall.cancel, async ({ params }) => {
+      await agent.cancelBackgroundToolCall(params);
+      return {};
+    })
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
 }
 
 /**
- * The `availableCommands` of a setup response, so a client can show the
- * session's commands without waiting for an update. The agent sends a v1
- * client the same list as an `available_commands_update` after the response,
- * and a v2 client none (`ClaudeAcpAgent.afterSetupResponse`). Later changes
- * still arrive as updates. An empty list is left out, as the draft asks. The
- * commands are optional, so a failure to read them does not fail the setup.
+ * The `availableCommands` of a setup response, which v2 requires when the
+ * session has commands. The agent sends a v1 client the same list as an
+ * `available_commands_update` after the response, and a v2 client none
+ * (`ClaudeAcpAgent.afterSetupResponse`). Later changes still arrive as
+ * updates. An empty list is left out, as the draft asks. A failure to read
+ * the commands does not fail the setup: the result is `undefined`, and
+ * {@link afterSetupResponse} sends the commands in an update instead.
  */
 async function setupCommands(
   agent: ClaudeAcpAgent,
   sessionId: string,
   logger: Logger | undefined,
-): Promise<{ availableCommands?: v2.AvailableCommand[] }> {
+): Promise<{ availableCommands?: v2.AvailableCommand[] } | undefined> {
   try {
     const commands = await agent.availableCommands(sessionId);
     return commands.length > 0 ? { availableCommands: v2AvailableCommands(commands) } : {};
   } catch (error) {
     (logger ?? console).error(`Session ${sessionId}: failed to read the session's commands`, error);
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * The work that follows a v2 setup response, run once the response is sent
+ * (`ClaudeAcpAgent.afterSetupResponse` does it on v1):
+ *
+ * - When `commands` is `undefined` (reading them for the response failed),
+ *   an `available_commands_update` with the commands, read again.
+ * - `then`, such as sending the current states of replayed subagents.
+ * - OAuth for the MCP servers that need it. Its URL elicitation must not
+ *   reach the client before the response, which v2 asks against.
+ */
+function afterSetupResponse(
+  agent: ClaudeAcpAgent,
+  sessionId: string,
+  mcpServers: McpServer[],
+  commands: { availableCommands?: v2.AvailableCommand[] } | undefined,
+  logger: Logger | undefined,
+  then?: () => void,
+): void {
+  setTimeout(() => {
+    if (!commands) {
+      agent.sendAvailableCommandsUpdate(sessionId).catch((error) => {
+        (logger ?? console).error(
+          `Session ${sessionId}: failed to send the session's commands`,
+          error,
+        );
+      });
+    }
+    then?.();
+    agent.authenticateMcpServers(sessionId, mcpServers);
+  }, 0);
 }
 
 /**
@@ -144,12 +250,30 @@ async function setupCommands(
 class V2ClientConnection implements AcpClient {
   /**
    * The sessions whose history replays, each with the messages that the
-   * replay has cleared so far.
+   * replay has cleared so far. A subagent that a replay announces replays
+   * with it.
    */
   private readonly replays = new Map<string, Set<string>>();
 
+  /** The session whose replay announced each replaying subagent. */
+  private readonly replayRoots = new Map<string, string>();
+
+  /**
+   * The last work state that a replay reported for each subagent, as the
+   * `state_update` of the child's own stream. It goes out once the replay
+   * ends: v2 forbids replaying a child's past `running` and `idle` as current
+   * activity.
+   */
+  private readonly replayedChildStates = new Map<string, v2.UpdateSessionNotification>();
+
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
+
+  /** The `_meta` that the client stores for each tool call. */
+  readonly toolCallMeta = new V2ToolCallMeta();
+
+  /** The `background` list of each session's `state_update`s. */
+  readonly background = new V2Background(this.terminals);
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -163,13 +287,28 @@ class V2ClientConnection implements AcpClient {
    * replayed message, and chunks append, so before the first replayed chunk of
    * each message the client gets the message with no content, which clears it,
    * as v2 requires of a message replayed as chunks.
+   *
+   * Each replayed subagent gets one `state_update` on its own stream, with its
+   * last state, after the replay.
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
     this.replays.set(sessionId, new Set());
+    const children = () =>
+      [...this.replayRoots].filter(([, root]) => root === sessionId).map(([child]) => child);
     try {
-      return await restore();
+      const result = await restore();
+      for (const child of children()) {
+        const state = this.replayedChildStates.get(child);
+        if (state) void this.send(state);
+      }
+      return result;
     } finally {
       this.replays.delete(sessionId);
+      for (const child of children()) {
+        this.replays.delete(child);
+        this.replayRoots.delete(child);
+        this.replayedChildStates.delete(child);
+      }
     }
   }
 
@@ -183,9 +322,11 @@ class V2ClientConnection implements AcpClient {
    * request opening.)
    */
   send(notification: v2.UpdateSessionNotification): Promise<void> {
-    return this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
-      this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
-    });
+    return this.ctx
+      .notify(v2.methods.client.session.update, this.background.stamp(notification))
+      .catch((error) => {
+        this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
+      });
   }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
@@ -196,22 +337,50 @@ class V2ClientConnection implements AcpClient {
   }
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+    // A subagent that a replay announces replays too, so its messages are
+    // cleared before their first replayed chunk, as the parent's are.
+    if (
+      update.sessionUpdate === "subagent_update" &&
+      this.replays.has(notification.sessionId) &&
+      !this.replays.has(update.sessionId)
+    ) {
+      this.replays.set(update.sessionId, new Set());
+      this.replayRoots.set(
+        update.sessionId,
+        this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
+      );
+    }
     const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
       const clear = this.replayClear(notification.sessionId, v2Update);
       return clear ? [clear, v2Update] : [v2Update];
     });
+    // A subagent's work state also goes to the child's own stream, after the
+    // parent's copy. During a replay, only its last state goes, after the
+    // replay (see `replayedChildStates`).
+    let childState = v2ChildStateUpdate(update);
+    if (childState && this.replays.has(notification.sessionId)) {
+      this.replayedChildStates.set(childState.sessionId, childState);
+      childState = undefined;
+    }
     // Every update goes to the connection before any is awaited, so an update
-    // that another call sends meanwhile cannot come between them.
+    // that another call sends meanwhile cannot come between them. The parent's
+    // copy is stamped first: a child's announcement starts its list.
+    const stamped = [
+      ...updates.map((v2Update) => this.background.stamp({ ...notification, update: v2Update })),
+      ...(childState ? [this.background.stamp(childState)] : []),
+    ];
     await Promise.all(
-      updates.map((v2Update) =>
-        this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
+      stamped.map((v2Notification) =>
+        this.ctx.notify(v2.methods.client.session.update, v2Notification),
       ),
     );
   }
 
   /**
    * The v2 updates of a v1 update: for a tool call report, the updates of its
-   * terminal first, then the report itself (see {@link V2Terminals}).
+   * terminal first (see {@link V2Terminals}), then the report itself, with the
+   * `_meta` keys that it changes (see {@link V2ToolCallMeta}), and during a
+   * replay the `_meta` of a tool call that the report cleared.
    */
   private v2Updates(
     sessionId: string,
@@ -222,8 +391,25 @@ class V2ClientConnection implements AcpClient {
       return v2Update ? [v2Update] : [];
     }
     const { terminal, report } = this.terminals.split(sessionId, update);
-    const reportUpdate = report && v2SessionUpdate(report);
-    return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
+    if (!report) return terminal;
+    const starts = report.sessionUpdate === "tool_call";
+    const replaying = this.replays.has(sessionId);
+    // A v1 `tool_call` starts the tool call afresh, but v2 only has updates,
+    // which keep each field they leave out. The client may already hold this
+    // id: from an earlier report on this connection, or, during a replay, from
+    // before it (a client that resumes a session it showed before).
+    const restarts =
+      starts && (replaying || this.toolCallMeta.reported(sessionId, report.toolCallId));
+    const [reported, metaPatch] = this.toolCallMeta.apply(sessionId, report, starts, replaying);
+    const reportUpdate = restarts ? v2RestartedToolCall(reported) : v2SessionUpdate(reported);
+    const metaUpdate = metaPatch
+      ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
+      : undefined;
+    return [
+      ...terminal,
+      ...(reportUpdate ? [reportUpdate] : []),
+      ...(metaUpdate ? [metaUpdate] : []),
+    ];
   }
 
   /**
@@ -246,10 +432,12 @@ class V2ClientConnection implements AcpClient {
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The subject is an update of the tool call, with its stored `_meta`.
+    const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
-      v2PermissionRequest(params),
-      { cancellationSignal: signal },
+      v2PermissionRequest({ ...params, toolCall }),
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
     return v1PermissionResponse(response);
   }
@@ -265,7 +453,7 @@ class V2ClientConnection implements AcpClient {
       // one only in a received value. As on v1, an MCP server's schema is
       // relayed here unchanged, so this cast does not check it.
       params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal },
+      { cancellationSignal: signal, stopWaitingOnCancel: true },
     );
   }
 

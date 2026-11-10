@@ -7,9 +7,13 @@
  *
  * A last message longer than the tail window leaves no message in it: then
  * the tail window grows, up to {@link MAX_TAIL_SIZE}, until it holds one.
+ *
+ * The open background tasks come from the tail, on top of the tasks of an
+ * earlier scan (see `background-tasks.ts`).
  */
 
 import * as fs from "node:fs/promises";
+import { backgroundTasksOf, type BackgroundTasks } from "./background-tasks.js";
 import { firstPrompt, isUserPrompt, mediaPrompt, promptOf } from "./first-prompt.js";
 
 const CHUNK_SIZE = 64 * 1024;
@@ -51,6 +55,14 @@ export type TranscriptFacts = {
   /** The session this one was forked from: the `forkedFrom.sessionId` that
    *  the SDK and CLI fork write on every copied record. */
   forkedFrom?: string;
+  /** What the last `worktree-state` record says: true when its
+   *  `worktreeSession` is set and not `enteredExisting` (Claude Code made the
+   *  worktree and the session is in it), false when it says otherwise.
+   *  Undefined when no such record was read. See {@link agentWorktreeOf}. */
+  agentWorktree?: boolean;
+  /** The background tasks that did not end. From the tail, on top of what
+   *  an earlier scan found when the file only grew within the tail. */
+  backgroundTasks?: BackgroundTasks;
   /** Whether the head or the tail holds a user or an assistant message. A
    *  transcript without one is a metadata-only stub. */
   hasMessages: boolean;
@@ -67,12 +79,12 @@ export type HeadTail = {
 };
 
 /** Facts that an earlier scan may have found before the tail window. */
-const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt"] as const;
+const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "agentWorktree"] as const;
 
 /** What an earlier scan of the same file found, at `size`. */
 export type PreviousScan = { size: number } & Pick<
   TranscriptFacts,
-  "lastPromptAt" | "promptSearched" | (typeof INHERITED_FACTS)[number]
+  "lastPromptAt" | "promptSearched" | "backgroundTasks" | (typeof INHERITED_FACTS)[number]
 >;
 
 /** The last `window` bytes of a file of `size` bytes, without the first,
@@ -152,6 +164,14 @@ export async function scanTranscriptFile(
       }
     }
   }
+  const previousTasks = grownWithinTail ? previous.backgroundTasks : undefined;
+  facts.backgroundTasks = tailBackgroundTasks(read.tail, size, previousTasks);
+  // No worktree record in the tail (or before it, by an earlier scan): the
+  // one `claude --worktree` writes at the start may still be in the head.
+  if (facts.agentWorktree === undefined) {
+    const agentWorktree = agentWorktreeOf(read.head);
+    if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
+  }
   if (facts.lastPromptAt !== undefined || size <= CHUNK_SIZE) {
     facts.promptSearched = true;
   } else if (grownWithinTail && (previous.lastPromptAt !== undefined || previous.promptSearched)) {
@@ -163,7 +183,8 @@ export async function scanTranscriptFile(
   if (!facts.hasMessages || complete(facts) || size <= CHUNK_SIZE) return facts;
   const key = `${filePath}\0${size}\0${identity ?? ""}`;
   const searched = fullySearched.get(key);
-  if (searched) return searched;
+  // The tasks can differ by the earlier scan.
+  if (searched) return { ...searched, backgroundTasks: facts.backgroundTasks };
   let result = facts;
   const handle = await fs.open(filePath, "r");
   try {
@@ -199,9 +220,15 @@ export async function scanTranscriptFile(
         ...wider,
         ...(facts.model !== undefined && { model: facts.model }),
         ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
+        // The wider tail holds the narrow one, so a record it has is the
+        // latest; else the narrow scan's (inherited or from the head) stands.
+        ...((wider.agentWorktree ?? facts.agentWorktree) !== undefined && {
+          agentWorktree: wider.agentWorktree ?? facts.agentWorktree,
+        }),
         // A turn end the wider tail lacks may lie before it: the
         // narrow scan inherited it from an earlier scan of this file.
         lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
+        backgroundTasks: facts.backgroundTasks,
         hasMessages: facts.hasMessages,
         lastPromptAt,
         // Searched to the start of the file, or found.
@@ -221,6 +248,22 @@ export async function scanTranscriptFile(
   return result;
 }
 
+/**
+ * The background tasks of the tail of a file of `size` bytes. `previous`:
+ * the tasks of an earlier scan, when the file only grew within the tail
+ * since. The set is complete when the tail is the whole file, or when it
+ * holds all records after a complete earlier set.
+ */
+function tailBackgroundTasks(
+  tail: string,
+  size: number,
+  previous: BackgroundTasks | undefined,
+): BackgroundTasks {
+  if (size <= CHUNK_SIZE) return backgroundTasksOf(tail, { complete: true });
+  if (previous?.complete) return backgroundTasksOf(tail, { complete: true, after: previous });
+  return backgroundTasksOf(tail, { complete: false });
+}
+
 const RELOCATED_MARKER = '"relocated"';
 
 /** The cwd of the last `relocated` record of the tail: where the session
@@ -234,6 +277,43 @@ export function relocatedCwd(tail: string): string | undefined {
     if (entry?.type === "relocated" && typeof entry.relocatedCwd === "string") {
       return entry.relocatedCwd;
     }
+  }
+  return undefined;
+}
+
+const WORKTREE_STATE_MARKER = '"worktree-state"';
+
+/**
+ * Whether the last `worktree-state` record of `text` says the session is in
+ * a worktree that Claude Code made for it, as AIR's native Claude provider
+ * reads it: a `worktreeSession` that is an object without
+ * `enteredExisting: true`. The last line that parses as a `worktree-state`
+ * record decides; any other `worktreeSession` (`null`, which the CLI writes
+ * when the session leaves the worktree, missing, or no object) means false.
+ * Only lines that are not JSON (such as the cut first line of a window) are
+ * skipped. Undefined when `text` holds no such record.
+ *
+ * The CLI writes the record when it enters or leaves a worktree (for
+ * `claude --worktree`, at the start of the session, so in the head), and
+ * writes it again with the other session metadata at the end of the
+ * transcript (on exit and as the transcript grows), so the tail usually
+ * holds the latest one. Only the head and the tail are read: a session that
+ * entered a worktree midway through a long transcript, with no metadata
+ * written after it yet, is not seen until the CLI writes the metadata again.
+ */
+export function agentWorktreeOf(text: string): boolean | undefined {
+  if (!text.includes(WORKTREE_STATE_MARKER)) return undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes(WORKTREE_STATE_MARKER)) continue;
+    const entry = parseLine(line);
+    // Only a line that is no JSON record is skipped: the latest record that
+    // parses decides, even when its `worktreeSession` is missing or no object.
+    if (entry?.type !== "worktree-state") continue;
+    const session = entry.worktreeSession;
+    if (!session || typeof session !== "object" || Array.isArray(session)) return false;
+    return (session as { enteredExisting?: unknown }).enteredExisting !== true;
   }
   return undefined;
 }
@@ -344,6 +424,10 @@ export function scanTranscript(
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
   const forkedFrom = FORKED_FROM_PATTERN.exec(head)?.[1];
   if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
+  // The tail only: scanTranscriptFile falls back to the head after it
+  // inherits what an earlier scan found before the tail.
+  const agentWorktree = agentWorktreeOf(tail);
+  if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
 
   const lines = tail.split("\n");
   let turnEndFound = false;

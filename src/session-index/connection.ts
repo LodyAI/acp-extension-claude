@@ -15,15 +15,16 @@ import {
   type InitializeRequest,
   type ListSessionsRequest,
   type ListSessionsResponse,
-} from "@agentclientprotocol/sdk";
-import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
+  AIR_SESSION_BATCH_GET_CAPABILITY,
   AIR_SESSION_INDEX_CAPABILITY,
   AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
   AIR_SESSION_RENAME_CAPABILITY,
+  AIR_SESSION_WORKTREES_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
@@ -41,10 +42,13 @@ import {
 } from "./list-subscriptions.js";
 import {
   archiveInsteadOfDelete,
+  deleteSessionIfStored,
   archiveTo,
   renameTo,
   parseRenameSessionRequest,
   parseSessionIdRequest,
+  parseBatchGetSessionsRequest,
+  SESSION_BATCH_GET_METHOD,
   SESSION_ARCHIVE_METHOD,
   SESSION_RENAME_METHOD,
   SESSION_UNARCHIVE_METHOD,
@@ -53,6 +57,8 @@ import {
   type RetitleOptions,
   type SessionIdRequest,
   type TitleChange,
+  type BatchGetSessionsRequest,
+  type BatchGetSessionsResponse,
 } from "./service.js";
 
 /** What the session index keeps on each `Session`. */
@@ -143,15 +149,17 @@ export class SessionIndexConnection {
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
-   *  itself, archive, rename and the list subscription, all only to a client
-   *  that declared `sessionIndex`. */
+   *  itself, batch get, archive, rename, the list subscription and the `agentWorktree`
+   *  row field, all only to a client that declared `sessionIndex`. */
   capabilities(): string[] {
     return this.service
       ? [
           AIR_SESSION_INDEX_CAPABILITY,
+          AIR_SESSION_BATCH_GET_CAPABILITY,
           AIR_SESSION_ARCHIVE_CAPABILITY,
           AIR_SESSION_RENAME_CAPABILITY,
           AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
+          AIR_SESSION_WORKTREES_CAPABILITY,
         ]
       : [];
   }
@@ -187,6 +195,31 @@ export class SessionIndexConnection {
     this.service?.ownSessionChanged(sessionId);
   }
 
+  /**
+   * Runs `fork`, the handler of a `session/fork` request of `sourceId`. The
+   * session list holds back the forks of the source until the response is
+   * out. The client then knows a fork from the response before a list shows
+   * it.
+   */
+  async forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
+    // The forks of this connection: the request handler reads the service
+    // once, so a later `initialize` does not split the start and the answer.
+    const service = this.service;
+    service?.forkStarted(sourceId);
+    try {
+      return await fork();
+    } finally {
+      // The SDK writes the response in the microtasks after the handler
+      // resolves, so a `setTimeout(0)` callback runs after it.
+      setTimeout(() => service?.forkAnswered(sourceId), 0);
+    }
+  }
+
+  /** The `session/fork` of `sourceId` copied the transcript into `forkId`. */
+  onForkCreated(sourceId: string, forkId: string): void {
+    this.service?.forkCreated(sourceId, forkId);
+  }
+
   /** `_session/list/subscribe`. */
   subscribeList(params: ListSubscribeRequest): Promise<ListSubscribeResponse> {
     return this.requireService(LIST_SUBSCRIBE_METHOD).subscribeList(params.cwd);
@@ -201,6 +234,12 @@ export class SessionIndexConnection {
   /** `session/list` of a `sessionIndex` client; undefined for another one. */
   list(params: ListSessionsRequest): Promise<ListSessionsResponse> | undefined {
     return this.service?.list(params, (sessionId) => this.ownSessionState(sessionId));
+  }
+
+  batchGet(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse> {
+    return this.requireService(SESSION_BATCH_GET_METHOD).batchGet(params, (sessionId) =>
+      this.ownSessionState(sessionId),
+    );
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):
@@ -336,7 +375,8 @@ export class SessionIndexConnection {
    * - Another AIR client uses delete to mark a session done, and may reopen
    *   it later: the adapter archives it instead (as `_session/archive` does,
    *   after the CLI closed), so the transcript survives.
-   * - Every other client: the SDK delete, as before.
+   * - Every other client: the SDK delete. A session without a transcript
+   *   succeeds (see {@link deleteSessionIfStored}).
    */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     const loaded = this.host.agent.sessions[params.sessionId] !== undefined;
@@ -350,7 +390,7 @@ export class SessionIndexConnection {
     } else if (this.host.isAirClient()) {
       await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
     } else {
-      await sdkDeleteSession(params.sessionId);
+      await deleteSessionIfStored(params.sessionId);
     }
     return {};
   }
@@ -420,6 +460,7 @@ export class SessionIndexConnection {
 
 /** The agent methods behind the session index extension methods. */
 type SessionIndexMethods = {
+  batchGetSessions(params: BatchGetSessionsRequest): Promise<BatchGetSessionsResponse>;
   subscribeSessionList(params: ListSubscribeRequest): Promise<ListSubscribeResponse>;
   unsubscribeSessionList(params: ListUnsubscribeRequest): Promise<EmptyResponse>;
   renameSessionTitle(params: RenameSessionRequest): Promise<EmptyResponse>;
@@ -427,10 +468,15 @@ type SessionIndexMethods = {
   unarchiveSession(params: SessionIdRequest): Promise<EmptyResponse>;
 };
 
-/** Routes `_session/list/subscribe`, `_session/list/unsubscribe`,
+/** Routes `_session/batch_get`, `_session/list/subscribe`, `_session/list/unsubscribe`,
  *  `_session/rename`, `_session/archive` and `_session/unarchive`. */
 export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexMethods): AgentApp {
   return app
+    .onRequest<BatchGetSessionsRequest, BatchGetSessionsResponse>(
+      SESSION_BATCH_GET_METHOD,
+      { parse: parseBatchGetSessionsRequest },
+      (ctx) => agent().batchGetSessions(ctx.params),
+    )
     .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
       LIST_SUBSCRIBE_METHOD,
       { parse: parseListSubscribeRequest },

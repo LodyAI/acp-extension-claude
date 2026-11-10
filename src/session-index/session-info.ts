@@ -4,7 +4,7 @@
  * the RFDs in `_meta.jetbrains.air`.
  */
 
-import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
 import { withAirMeta } from "../air-extension.js";
 import { deriveActivity, selectCost, type OwnSessionState } from "./activity.js";
 import type { LiveRecord } from "./live-registry.js";
@@ -38,6 +38,7 @@ export function sessionInfoOf(
     lastPromptAt: iso(facts.lastPromptAt),
     model: facts.model,
     forkedFrom: facts.forkedFrom,
+    agentWorktree: row.agentWorktree,
     state: activity?.state,
     lastTurnEndedAt: activity?.lastTurnEndedAt,
     cost: cost === undefined ? undefined : { amount: cost, currency: "USD" },
