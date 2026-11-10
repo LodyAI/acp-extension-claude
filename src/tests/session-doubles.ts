@@ -7,6 +7,7 @@
 
 import { vi } from "vitest";
 import { randomUUID } from "crypto";
+import { SessionBackgroundWork } from "../background-work.js";
 import { SessionTitles } from "../session-titles.js";
 
 /** Stand-in agent for a `SessionTitles` whose test doesn't care about titles:
@@ -64,7 +65,12 @@ export function mockSessionState(
     modes: { currentModeId: "default", availableModes: [] },
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
-    settingsManager: { dispose: vi.fn(), getSettings: () => ({}) },
+    settingsManager: {
+      dispose: vi.fn(),
+      getSettings: () => ({}),
+      getApiKeyHelper: () => undefined,
+      getCwd: () => process.cwd(),
+    },
     accumulatedUsage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -81,9 +87,11 @@ export function mockSessionState(
     contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),
+    subagentChecklists: new Set(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
+    background: new SessionBackgroundWork(sessionId, false),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),

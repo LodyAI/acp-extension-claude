@@ -1,4 +1,3 @@
-import { readClientSystemPrompt } from "../client-system-prompt.js";
 /**
  * The ACP v2 session lifecycle, expressed through the v1 session methods of
  * `ClaudeAcpAgent`: v2 requests become the v1 requests that the agent serves,
@@ -18,16 +17,19 @@ import {
   type SessionConfigSelectGroup,
   type SessionConfigSelectOptions,
   type SetSessionConfigOptionRequest,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+  type SystemPrompt,
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import { V2_SESSION_CAPABILITIES } from "./initialize.js";
+import { v1ContentBlock } from "./prompt.js";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
   const { mcpServers, systemPrompt, ...request } = params;
   // v1 requires the list; v2 treats an omitted list as an empty one.
   return {
     ...request,
-    systemPrompt: v1SystemPrompt(systemPrompt),
-    mcpServers: (mcpServers ?? []).map(v1McpServer),
+    mcpServers: v1McpServers(mcpServers) ?? [],
+    ...v1SystemPromptField(systemPrompt),
   };
 }
 
@@ -45,17 +47,15 @@ export function v1RestoreSessionRequest(
 ):
   | { method: "resume"; request: ResumeSessionRequest }
   | { method: "load"; request: LoadSessionRequest } {
-  const { replayFrom, mcpServers, systemPrompt, ...request } = params;
+  const { replayFrom, mcpServers, systemPrompt, ...rest } = params;
+  const request = { ...rest, ...v1SystemPromptField(systemPrompt) };
   if (replayFrom == null) {
     return {
       method: "resume",
-      request: {
-        ...request,
-        systemPrompt: v1SystemPrompt(systemPrompt),
-        ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
-      },
+      request: { ...request, ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}) },
     };
   }
+  const servers = v1McpServers(mcpServers);
   if (replayFrom.type !== "start") {
     throw RequestError.invalidParams(
       { replayFrom },
@@ -64,38 +64,32 @@ export function v1RestoreSessionRequest(
   }
   return {
     method: "load",
-    request: {
-      ...request,
-      systemPrompt: v1SystemPrompt(systemPrompt),
-      mcpServers: (mcpServers ?? []).map(v1McpServer),
-    },
+    request: { ...request, mcpServers: servers ?? [] },
   };
 }
 
 /**
- * The v1 requests that a v2 `session/fork` means.
- *
- * The agent's v1 fork copies the transcript into a new session and returns
- * only its id; a v1 client then resumes or loads it. A v2 fork returns the new
- * session with its config options, like `session/new`, so the client can
- * prompt it. The v2 surface therefore forks, then resumes the fork without
- * replay, with the request's `cwd`, `additionalDirectories`, and
- * `mcpServers`. The request's `_meta` goes to the fork alone.
+ * The v1 request of a v2 `session/fork`. In both versions the agent's fork
+ * returns a session that the client can prompt, with its config options.
  */
-export function v1ForkSessionRequests(params: v2.ForkSessionRequest): {
-  fork: ForkSessionRequest;
-  resume: (sessionId: string) => ResumeSessionRequest;
-} {
-  const { mcpServers, _meta, systemPrompt, ...request } = params;
-  const session = {
-    ...request,
-    systemPrompt: v1SystemPrompt(systemPrompt),
-    ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
-  };
+export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
+  const { mcpServers, systemPrompt, ...request } = params;
   return {
-    fork: { ...session, ...(_meta != null ? { _meta } : {}) },
-    resume: (sessionId) => ({ ...session, sessionId }),
+    ...request,
+    ...(mcpServers ? { mcpServers: v1McpServers(mcpServers) } : {}),
+    ...v1SystemPromptField(systemPrompt),
   };
+}
+
+/**
+ * The v1 `systemPrompt`. Its content converts like prompt content: a v2
+ * annotation audience can be any string, and v1 takes only `user` or `assistant`.
+ */
+function v1SystemPromptField(systemPrompt: v2.SystemPrompt | null | undefined): {
+  systemPrompt?: SystemPrompt;
+} {
+  if (systemPrompt == null) return {};
+  return { systemPrompt: { ...systemPrompt, content: systemPrompt.content.map(v1ContentBlock) } };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */
@@ -151,9 +145,13 @@ function isGrouped(options: SessionConfigSelectOptions): options is SessionConfi
   return options.some((entry) => "group" in entry);
 }
 
-/** v2 tags the free-text input of a command with `type: "text"`. */
+/**
+ * v2 tags each command with `type: "command"` and its free-text input with
+ * `type: "text"`. A receiver drops a command without the `type` tag.
+ */
 export function v2AvailableCommands(commands: AvailableCommand[]): v2.AvailableCommand[] {
   return commands.map(({ input, ...command }) => ({
+    type: "command",
     ...command,
     ...(input != null ? { input: { type: "text", ...input } } : {}),
   }));
@@ -167,10 +165,22 @@ function v2ConfigOptionsField(options: SessionConfigOption[] | null | undefined)
 }
 
 /**
+ * The v1 list of the MCP servers of a v2 setup request, or undefined for no
+ * list. A request with two servers of the same `name`, or with a transport
+ * that the agent does not advertise in `session.mcp` (such as `acp` or a
+ * custom `_` type), fails with invalid params (-32602): the v1 session setup
+ * would otherwise drop the server without telling the client.
+ */
+function v1McpServers(servers: v2.McpServer[] | null | undefined): McpServer[] | undefined {
+  if (servers == null) return undefined;
+  v2.assertSupportedMcpServers(servers, V2_SESSION_CAPABILITIES.mcp);
+  return servers.map(v1McpServer);
+}
+
+/**
  * v2 requires a `type` on every transport and makes the empty lists optional.
  * The agent recognizes a v1 stdio server by its missing `type`, so the v2 tag
- * is dropped. A transport that v1 cannot express is rejected rather than
- * silently left out of the session.
+ * is dropped. {@link v1McpServers} has already rejected every other transport.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
@@ -180,16 +190,5 @@ function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isHttp(server)) {
     return { ...server, headers: server.headers ?? [] };
   }
-  if (v2.McpServer.isAcp(server)) {
-    return server;
-  }
-  throw RequestError.invalidParams(
-    { type: server.type },
-    `MCP servers of type ${server.type} are not supported`,
-  );
-}
-
-function v1SystemPrompt(value: unknown): NewSessionRequest["systemPrompt"] {
-  const prompt = readClientSystemPrompt(value);
-  return prompt ? { mode: prompt.mode, content: [{ type: "text", text: prompt.text }] } : undefined;
+  throw new Error(`Unreachable: MCP server of type ${server.type} passed the transport check`);
 }

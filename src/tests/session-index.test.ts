@@ -16,13 +16,18 @@ import {
   listSessions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
-import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import type { SessionInfo } from "@agentclientprotocol/sdk";
+import { ClaudeAcpAgent, v1AgentApp, type AcpClient } from "../acp-agent.js";
+import {
+  client as acpClient,
+  type InitializeResponse,
+  type SessionInfo,
+} from "@agentclientprotocol/sdk/unstable";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
   archiveTo,
   renameTo,
+  parseBatchGetSessionsRequest,
   SessionIndexService,
   writeCustomTitleSidecar,
 } from "../session-index/service.js";
@@ -44,6 +49,11 @@ import {
   wrapQuery,
 } from "./session-doubles.js";
 import { Pushable } from "../utils.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, readdir: vi.fn(actual.readdir) };
+});
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -69,10 +79,15 @@ beforeEach(async () => {
   configDir = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-cfg-")));
   workspace = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-ws-")));
   process.env.CLAUDE_CONFIG_DIR = configDir;
+  // Integration runs leave CLAUDE_CODE_EXECUTABLE unset, so initialize would run
+  // the real `claude auth status` in the background. It writes into configDir
+  // while afterEach removes it, and the rm fails with ENOTEMPTY.
+  vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
   vi.clearAllMocks();
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
   else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
   await fs.rm(configDir, { recursive: true, force: true });
@@ -180,6 +195,43 @@ const titleRecords = (sessionId: string, title: string) => [
   { type: "agent-name", agentName: title, sessionId },
 ];
 
+/** A `worktree-state` record, as the CLI writes it when a session enters
+ *  (`worktree` set) or leaves (null) a worktree. */
+const worktreeState = (
+  sessionId: string,
+  worktree: { path: string; enteredExisting?: boolean } | null,
+) => ({
+  type: "worktree-state",
+  worktreeSession: worktree && {
+    originalCwd: "/repo",
+    worktreePath: worktree.path,
+    worktreeName: path.basename(worktree.path),
+    worktreeBranch: `worktree-${path.basename(worktree.path)}`,
+    originalBranch: "main",
+    originalHeadCommit: "0123456789abcdef0123456789abcdef01234567",
+    sessionId,
+    ...(worktree.enteredExisting !== undefined && { enteredExisting: worktree.enteredExisting }),
+  },
+  sessionId,
+});
+
+/** A repository at `repo` with linked worktrees at `linked`, as git lays
+ *  them out. */
+async function linkWorktrees(repo: string, ...linked: string[]): Promise<void> {
+  await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+  for (const worktree of linked) {
+    const meta = path.join(repo, ".git", "worktrees", path.basename(worktree));
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(worktree, { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(worktree, ".git")}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    await fs.writeFile(path.join(worktree, ".git"), `gitdir: ${meta}\n`);
+  }
+}
+
+const agentWorktreeOfRow = (row: SessionInfo | undefined) =>
+  (row?._meta as any)?.jetbrains?.air?.agentWorktree;
+
 /** The last `count` records of a transcript. */
 async function lastRecords(file: string, count = 2): Promise<unknown[]> {
   const lines = (await fs.readFile(file, "utf8")).trim().split("\n");
@@ -220,9 +272,11 @@ const airCapabilities = (response: { _meta?: Record<string, unknown> | null }) =
 describe("sessionIndex negotiation", () => {
   const indexCapabilities = [
     "sessionIndex",
+    "sessionBatchGet",
     "sessionArchive",
     "sessionRename",
     "sessionListSubscribe",
+    "sessionWorktrees",
   ];
   const baseline = [
     "sessionFailure",
@@ -233,6 +287,7 @@ describe("sessionIndex negotiation", () => {
     "recommendedValue",
     "diffPatch",
     "planFile",
+    "backgroundSubagents",
   ];
 
   it("is advertised with sessionArchive and sessionRename only to an AIR client that declares it", async () => {
@@ -251,7 +306,7 @@ describe("sessionIndex negotiation", () => {
     // Declaring archive or rename alone enables nothing.
     const withoutIndex = await createAgent().agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: air("sessionArchive", "sessionRename"),
+      clientCapabilities: air("sessionArchive", "sessionRename", "sessionBatchGet"),
     });
     expect(airCapabilities(withoutIndex)).toEqual(baseline);
 
@@ -275,7 +330,7 @@ describe("sessionIndex negotiation", () => {
   it("answers method-not-found to the new methods without the capability", async () => {
     // Declaring sessionArchive or sessionRename without sessionIndex enables
     // nothing either.
-    for (const capabilities of [[], ["sessionArchive", "sessionRename"]]) {
+    for (const capabilities of [[], ["sessionArchive", "sessionRename", "sessionBatchGet"]]) {
       const { agent } = createAgent();
       await initializeClient(agent, air(...capabilities));
       const sessionId = randomUUID();
@@ -284,7 +339,420 @@ describe("sessionIndex negotiation", () => {
       });
       await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
       await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
+      await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toMatchObject({
+        code: -32601,
+      });
     }
+  });
+});
+
+describe("_session/batch_get", () => {
+  it("routes and validates the extension through the ACP connection", async () => {
+    let agent!: ClaudeAcpAgent;
+    const connection = acpClient({ name: "batch-get-test" }).connect(
+      v1AgentApp({ log: () => {}, error: () => {} }, (created) => {
+        agent = created;
+      }),
+    );
+    try {
+      const response = await connection.agent.request<InitializeResponse>("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: air("sessionIndex"),
+      });
+      expect(airCapabilities(response)).toContain("sessionBatchGet");
+      expect(await connection.agent.request("_session/batch_get", { sessionIds: [] })).toEqual({
+        sessions: [],
+      });
+      await expect(
+        connection.agent.request("_session/batch_get", { sessionIds: [], cwd: "/repo" }),
+      ).rejects.toMatchObject({ code: -32602 });
+    } finally {
+      connection.close();
+      await agent.dispose();
+    }
+  });
+
+  it("accepts only distinct, non-blank string ids and no other fields", () => {
+    for (const params of [
+      null,
+      [],
+      {},
+      { sessionIds: null },
+      { sessionIds: "id" },
+      { sessionIds: [""] },
+      { sessionIds: [" "] },
+      { sessionIds: [1] },
+      { sessionIds: ["id", "id"] },
+      { sessionIds: [], cwd: null },
+    ]) {
+      expect(() => parseBatchGetSessionsRequest(params)).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
+    const sessionIds = Array.from({ length: 1000 }, (_, i) => `id-${i}`);
+    expect(parseBatchGetSessionsRequest({ sessionIds })).toEqual({ sessionIds });
+    // Ids are exact, not trimmed or otherwise normalized.
+    expect(parseBatchGetSessionsRequest({ sessionIds: [" id ", "id"] })).toEqual({
+      sessionIds: [" id ", "id"],
+    });
+  });
+
+  it("returns empty results without touching the store", async () => {
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const lookup = vi.spyOn(index, "getSessions").mockRejectedValue(new Error("store down"));
+    expect(await agent.batchGetSessions({ sessionIds: [] })).toEqual({
+      sessions: [],
+    });
+    expect(lookup).not.toHaveBeenCalled();
+    await agent.dispose();
+  });
+
+  it("returns no sessions when the store is absent", async () => {
+    const { agent } = await indexAgent();
+    const sessionIds = [randomUUID(), "retained-id"];
+    expect(await agent.batchGetSessions({ sessionIds })).toEqual({
+      sessions: [],
+    });
+    await agent.dispose();
+  });
+
+  it("finds ids older than the recent 50 without listing or reading unrelated history", async () => {
+    const base = Date.parse("2026-03-01T00:00:00Z");
+    const ids: string[] = [];
+    for (let i = 0; i < 55; i++) {
+      ids.push(
+        (
+          await writeTranscript({
+            cwd: path.join(workspace, `project-${i % 2}`),
+            lastMessageAt: base - i * 60_000,
+          })
+        ).id,
+      );
+    }
+    const recent = await indexAgent();
+    const page = await recent.agent.listSessions({});
+    expect(page.sessions).toHaveLength(50);
+    expect(page.sessions.map((s) => s.sessionId)).not.toContain(ids[54]);
+    await recent.agent.dispose();
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const list = vi.spyOn(index, "list").mockRejectedValue(new Error("must not list"));
+    const names = vi.spyOn(index.listings, "namesOfAll").mockRejectedValue(new Error("history"));
+    const wanted = [ids[54]!, ids[53]!, ids[0]!];
+    const readdir = vi.mocked(fs.readdir);
+    readdir.mockClear();
+    try {
+      const result = await agent.batchGetSessions({ sessionIds: wanted });
+      expect(result.sessions.map((s) => s.sessionId)).toEqual(wanted);
+      expect(transcriptsRead(agent)).toBe(wanted.length);
+      const root = path.join(configDir, "projects");
+      const storeReads = readdir.mock.calls
+        .map(([dir]) => String(dir))
+        .filter((dir) => dir === root || dir.startsWith(root + path.sep));
+      expect(storeReads).toEqual([root]);
+      expect(list).not.toHaveBeenCalled();
+      expect(names).not.toHaveBeenCalled();
+      expect(listSessions).not.toHaveBeenCalled();
+      expect(getSessionInfo).not.toHaveBeenCalled();
+    } finally {
+      readdir.mockClear();
+      await agent.dispose();
+    }
+  });
+
+  it("keeps request order and copy selection across lookup chunks", async () => {
+    const base = Date.parse("2026-03-01T00:00:00Z");
+    const first = await writeTranscript({ lastMessageAt: base });
+    const last = await writeTranscript({ lastMessageAt: base - 60_000 });
+    const copyId = randomUUID();
+    await writeTranscript({ sessionId: copyId, prompt: "Old copy", lastMessageAt: base - 120_000 });
+    await writeTranscript({
+      sessionId: copyId,
+      cwd: path.join(workspace, "other"),
+      prompt: "New copy",
+      lastMessageAt: base - 30_000,
+    });
+    // 250 ids: three lookup chunks of 100, with found ids in the first, second and third.
+    const sessionIds: string[] = Array.from({ length: 250 }, () => randomUUID());
+    sessionIds[0] = last.id;
+    sessionIds[120] = copyId;
+    sessionIds[249] = first.id;
+    const { agent } = await indexAgent();
+    try {
+      const result = await agent.batchGetSessions({ sessionIds });
+      expect(result.sessions.map((s) => s.sessionId)).toEqual([last.id, copyId, first.id]);
+      expect(result.sessions[1]!.title).toBe("New copy");
+    } finally {
+      await agent.dispose();
+    }
+  });
+
+  it("recovers a cold batch row from a sibling and keeps it in the next list", async () => {
+    const base = Date.parse("2026-04-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    const fillers: string[] = [];
+    for (let i = 1; i <= 16; i++) {
+      fillers.push((await writeTranscript({ lastMessageAt: base - i * 1000 })).id);
+    }
+    // This sibling is older than the transcripts needed to fill the page.
+    await writeTranscript({ cwd: other, lastMessageAt: base - 3600_000 });
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const names = vi.spyOn(index.listings, "namesOfAll");
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    try {
+      const result = await agent.batchGetSessions({ sessionIds: [noCwd.id] });
+      expect(result.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[noCwd.id, other]]);
+      expect(transcriptsRead(agent)).toBe(2);
+      expect(names.mock.calls).toEqual([[[path.dirname(noCwd.file)]]]);
+      names.mockRestore();
+
+      // Use the same index without changing files or letting the negative cache expire.
+      const page = await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
+      expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+        [noCwd.id, other],
+        [fillers[0], workspace],
+      ]);
+      expect(page.sessions[0]).toEqual(result.sessions[0]);
+    } finally {
+      names.mockRestore();
+      now.mockRestore();
+      await agent.dispose();
+    }
+  });
+
+  it("bounds sibling cwd probes and retries a negative result after its cache expires", async () => {
+    const base = Date.parse("2026-04-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    const siblings: { id: string; file: string }[] = [];
+    for (let i = 1; i <= 70; i++) {
+      siblings.push(
+        await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base - i * 1000 }),
+      );
+    }
+    await writeTranscript({ lastMessageAt: base });
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const names = vi.spyOn(index.listings, "namesOfAll");
+    const at = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
+      expect(transcriptsRead(agent)).toBe(1 + 64);
+      expect(names.mock.calls).toEqual([[[path.dirname(noCwd.file)]]]);
+
+      // Rewriting an existing sibling does not change the directory mtime.
+      await writeTranscript({ sessionId: siblings[0]!.id, cwd: other, lastMessageAt: base });
+      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
+      expect(transcriptsRead(agent)).toBe(1 + 64);
+      expect(names).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(at + 60_001);
+      const result = await agent.batchGetSessions({ sessionIds: [noCwd.id] });
+      expect(result.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[noCwd.id, other]]);
+      expect(transcriptsRead(agent)).toBe(1 + 64 + 1);
+      expect(names.mock.calls).toEqual([
+        [[path.dirname(noCwd.file)]],
+        [[path.dirname(noCwd.file)]],
+      ]);
+    } finally {
+      names.mockRestore();
+      now.mockRestore();
+      await agent.dispose();
+    }
+  });
+
+  it("returns the same unscoped list rows for archived, worktree and duplicate copies in request order", async () => {
+    const repo = path.join(workspace, "repo");
+    const worktree = path.join(workspace, "worktree");
+    await linkWorktrees(repo, worktree);
+    const archivedId = randomUUID();
+    const archived = await writeTranscript({
+      sessionId: archivedId,
+      cwd: repo,
+      trailer: titleRecords(archivedId, "[archived] Done"),
+    });
+    const worktreeId = randomUUID();
+    await writeTranscript({
+      sessionId: worktreeId,
+      cwd: worktree,
+      trailer: [worktreeState(worktreeId, { path: worktree })],
+    });
+    const copyId = randomUUID();
+    await writeTranscript({ sessionId: copyId, cwd: repo, prompt: "Old copy" });
+    await writeTranscript({
+      sessionId: copyId,
+      cwd: worktree,
+      prompt: "New copy",
+      mtimeMs: Date.parse("2026-02-01"),
+    });
+    const { agent } = await indexAgent();
+    const requested = [worktreeId, archived.id, copyId];
+    const result = await agent.batchGetSessions({ sessionIds: requested });
+    const read = transcriptsRead(agent);
+    const listed = await agent.listSessions({ _meta: listMeta({ archived: "all" }) });
+    expect(transcriptsRead(agent)).toBe(read);
+    expect(result.sessions).toEqual(
+      requested.map((id) => listed.sessions.find((s) => s.sessionId === id)),
+    );
+    expect(airRow(result.sessions[1]!).archived).toBe(true);
+    expect(agentWorktreeOfRow(result.sessions[0])).toBe(true);
+    expect(result.sessions[2]).toMatchObject({ title: "New copy", cwd: worktree });
+    await agent.dispose();
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "returns readable sessions in request order and omits unavailable ids",
+    async () => {
+      const first = await writeTranscript({});
+      const found = await writeTranscript({});
+      const unreadable = await writeTranscript({});
+      await fs.chmod(unreadable.file, 0);
+      const absent = randomUUID();
+      const { agent } = await indexAgent();
+      try {
+        const result = await agent.batchGetSessions({
+          sessionIds: [absent, first.id, unreadable.id, found.id],
+        });
+        expect(result.sessions.map((s) => s.sessionId)).toEqual([first.id, found.id]);
+        expect(Object.keys(result)).toEqual(["sessions"]);
+      } finally {
+        await fs.chmod(unreadable.file, 0o600);
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "uses a readable copy when another copy cannot be read or stat'ed, as the unscoped list does",
+    async () => {
+      const sessionId = randomUUID();
+      await writeTranscript({ sessionId, prompt: "Readable copy" });
+      const hiddenProject = path.join(workspace, "inaccessible");
+      const unreadable = await writeTranscript({
+        sessionId,
+        cwd: hiddenProject,
+        prompt: "Unreadable newer copy",
+        mtimeMs: Date.parse("2026-02-01"),
+      });
+      const { agent } = await indexAgent();
+      try {
+        // A failed metadata read, then a failed stat of the same copy.
+        for (const target of [unreadable.file, path.dirname(unreadable.file)]) {
+          await fs.chmod(target, 0);
+          const result = await agent.batchGetSessions({ sessionIds: [sessionId] });
+          const listed = await agent.listSessions({});
+          expect(result).toEqual({ sessions: listed.sessions });
+          expect(result.sessions[0]?.title).toBe("Readable copy");
+          await fs.chmod(target, 0o700);
+        }
+      } finally {
+        await fs.chmod(path.dirname(unreadable.file), 0o700);
+        await fs.chmod(unreadable.file, 0o600);
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "omits failed stats, dangling links and non-file transcripts",
+    async () => {
+      const unreadable = await writeTranscript({ cwd: path.join(workspace, "inaccessible") });
+      const dangling = await writeTranscript({});
+      await fs.rm(dangling.file);
+      await fs.symlink(path.join(workspace, "not-there"), dangling.file);
+      const nonFile = await writeTranscript({});
+      await fs.rm(nonFile.file);
+      await fs.mkdir(nonFile.file);
+      const { agent } = await indexAgent();
+      const projectDir = path.dirname(unreadable.file);
+      await fs.chmod(projectDir, 0);
+      try {
+        const result = await agent.batchGetSessions({
+          sessionIds: [unreadable.id, dangling.id, nonFile.id],
+        });
+        expect(result).toEqual({ sessions: [] });
+      } finally {
+        await fs.chmod(projectDir, 0o700);
+        await agent.dispose();
+      }
+    },
+  );
+
+  it("matches UUIDs exactly without case or whitespace normalization", async () => {
+    const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await writeTranscript({ sessionId });
+    const { agent } = await indexAgent();
+    const result = await agent.batchGetSessions({
+      sessionIds: [sessionId.toUpperCase(), ` ${sessionId} `, sessionId],
+    });
+    expect(result.sessions.map((row) => row.sessionId)).toEqual([sessionId]);
+    await agent.dispose();
+  });
+
+  it("omits empty, malformed, sidecar-only and unresolved-cwd records", async () => {
+    const empty = await writeTranscript({});
+    await fs.writeFile(empty.file, "");
+    const malformed = await writeTranscript({});
+    await fs.writeFile(malformed.file, "not json\n");
+    const sidecar = randomUUID();
+    const sidecarDir = path.join(configDir, "projects", encodeProjectPath(workspace), sidecar);
+    await fs.mkdir(sidecarDir, { recursive: true });
+    await fs.writeFile(path.join(sidecarDir, "custom-title.json"), '{"customTitle":"Saved"}');
+    const unresolved = await writeTranscript({
+      cwd: path.join(workspace, "unknown"),
+      recordCwd: null,
+    });
+    const { agent } = await indexAgent();
+    const ids = [empty.id, malformed.id, sidecar, unresolved.id];
+    const result = await agent.batchGetSessions({ sessionIds: ids });
+    expect(result).toEqual({ sessions: [] });
+    await agent.dispose();
+  });
+
+  it
+    .skipIf(process.platform === "win32" || process.getuid?.() === 0)
+    .each(["unreadable", "unreadable after a cached list", "a file", "a dangling symlink"])(
+    "rejects a projects root that is %s",
+    async (kind) => {
+      const found = await writeTranscript({});
+      const root = path.join(configDir, "projects");
+      const { agent } = await indexAgent();
+      try {
+        if (kind === "unreadable after a cached list") {
+          const old = new Date(Date.now() - 60_000);
+          await fs.utimes(root, old, old);
+          await agent.listSessions({});
+        }
+        if (kind.startsWith("unreadable")) {
+          await fs.chmod(root, 0);
+        } else {
+          await fs.rm(root, { recursive: true });
+          if (kind === "a file") await fs.writeFile(root, "not a store");
+          else await fs.symlink(path.join(workspace, "missing-store"), root);
+        }
+        for (const sessionId of [found.id, "retained-id"]) {
+          await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
+            "Session store could not be read",
+          );
+        }
+      } finally {
+        if (kind.startsWith("unreadable")) await fs.chmod(root, 0o700);
+        await agent.dispose();
+      }
+    },
+  );
+
+  it("rejects under ACP v2 even when sessionIndex was declared", async () => {
+    const { agent } = createAgent({ v2: true });
+    await initializeClient(agent, air("sessionIndex"));
+    await expect(agent.batchGetSessions({ sessionIds: [] })).rejects.toMatchObject({
+      code: -32601,
+    });
+    await agent.dispose();
   });
 });
 
@@ -516,6 +984,116 @@ describe("session/list of a sessionIndex client", () => {
     ).rejects.toMatchObject({ code: -32602 });
   });
 
+  it("marks the rows of sessions in a worktree Claude Code made (agentWorktree)", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const entered = path.join(workspace, "entered");
+    const user = path.join(workspace, "user");
+    const left = path.join(workspace, "left");
+    await linkWorktrees(repo, made, entered, user, left);
+    const madeId = randomUUID();
+    const enteredId = randomUUID();
+    const leftId = randomUUID();
+    const mainId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      lastMessageAt: base,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inEntered = await writeTranscript({
+      sessionId: enteredId,
+      cwd: entered,
+      lastMessageAt: base - 1000,
+      trailer: [worktreeState(enteredId, { path: entered, enteredExisting: true })],
+    });
+    // A worktree the user made: no record.
+    const inUser = await writeTranscript({ cwd: user, lastMessageAt: base - 2000 });
+    // Left the worktree: the later null record wins.
+    const inLeft = await writeTranscript({
+      sessionId: leftId,
+      cwd: left,
+      lastMessageAt: base - 3000,
+      trailer: [worktreeState(leftId, { path: left }), worktreeState(leftId, null)],
+    });
+    // The main checkout, with a record that says otherwise: not in a linked
+    // worktree, so no field.
+    const inMain = await writeTranscript({
+      sessionId: mainId,
+      cwd: repo,
+      lastMessageAt: base - 4000,
+      trailer: [worktreeState(mainId, { path: made })],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, made, true],
+      [inEntered.id, entered, undefined],
+      [inUser.id, user, undefined],
+      [inLeft.id, left, undefined],
+      [inMain.id, repo, undefined],
+    ]);
+    // The field is omitted, not false.
+    for (const row of page.sessions.slice(1)) {
+      expect((row._meta as any)?.jetbrains?.air ?? {}).not.toHaveProperty("agentWorktree");
+    }
+    // The worktree's own list carries it too.
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, true],
+    ]);
+  });
+
+  it("marks a session that made its worktree mid-session, and not after a malformed record", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const other = path.join(workspace, "other");
+    await linkWorktrees(repo, made, other);
+    // Started in the main checkout, then EnterWorktree made a worktree: the
+    // CLI moved the transcript there, so the row's cwd is the worktree.
+    const movedId = randomUUID();
+    const moved = await writeTranscript({
+      sessionId: movedId,
+      cwd: repo,
+      dirName: encodeProjectPath(made),
+      lastMessageAt: base,
+      trailer: [
+        worktreeState(movedId, { path: made }),
+        { type: "relocated", sessionId: movedId, relocatedCwd: made },
+      ],
+    });
+    // The latest record has no worktreeSession object: it decides, so the
+    // older marked one does not count.
+    const malformedId = randomUUID();
+    const malformed = await writeTranscript({
+      sessionId: malformedId,
+      cwd: other,
+      lastMessageAt: base - 1000,
+      trailer: [
+        worktreeState(malformedId, { path: other }),
+        { type: "worktree-state", worktreeSession: "other", sessionId: malformedId },
+      ],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+      [malformed.id, other, undefined],
+    ]);
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+    ]);
+  });
+
   it("recovers the cwd of a session whose head has none", async () => {
     // A first prompt beyond 64 KB pushes the first cwd out of the head; the
     // tail cwd is a subdirectory of the project.
@@ -662,7 +1240,7 @@ describe("old session/list path", () => {
     expect(page.sessions.map((s) => s.sessionId)).toEqual([session.id]);
     expect(page.sessions[0]).not.toHaveProperty("_meta");
     expect(vi.mocked(listSessions).mock.calls).toEqual([
-      [{ dir: workspace, limit: 1001, offset: 0 }],
+      [{ dir: workspace, includeWorktrees: false, limit: 1001, offset: 0 }],
     ]);
 
     // AIR without sessionIndex: the same SDK call.
@@ -673,7 +1251,7 @@ describe("old session/list path", () => {
       (await airAgent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId),
     ).toEqual([session.id]);
     expect(vi.mocked(listSessions).mock.calls).toEqual([
-      [{ dir: workspace, limit: 1001, offset: 0 }],
+      [{ dir: workspace, includeWorktrees: false, limit: 1001, offset: 0 }],
     ]);
   });
 
@@ -1153,6 +1731,38 @@ describe("_session/list/subscribe", () => {
     await agent.dispose();
   });
 
+  it("holds a fork back until the response of its session/fork is out", async () => {
+    const { rowsOf, agent } = await subscribedAgent();
+    const parent = await writeTranscript({ prompt: "Parent" });
+    expect(await waitFor(() => rowsOf(parent.id).length > 0)).toBe(true);
+    let answer!: () => void;
+    const responded = new Promise<void>((resolve) => (answer = resolve));
+    const forkWritten = writeTranscript({ prompt: "Parent", forkedFrom: parent.id });
+    // A fork whose head has no `forkedFrom`, as one with a first record over 64 KB.
+    const unmarkedWritten = writeTranscript({ prompt: "Parent" });
+    const forked = agent.forking(parent.id, async () => {
+      await forkWritten;
+      (agent as any).sessionIndex.onForkCreated(parent.id, (await unmarkedWritten).id);
+      await responded;
+    });
+    const fork = await forkWritten;
+    const unmarked = await unmarkedWritten;
+    // A session that is no fork of the parent goes out meanwhile.
+    const other = await writeTranscript({ prompt: "Other" });
+    expect(await waitFor(() => rowsOf(other.id).length > 0)).toBe(true);
+    expect(rowsOf(fork.id)).toEqual([]);
+    expect(rowsOf(unmarked.id)).toEqual([]);
+    const listed = await agent.listSessions({ cwd: workspace });
+    expect(listed.sessions.map((s) => s.sessionId)).not.toContain(unmarked.id);
+
+    answer();
+    await forked;
+    expect(await waitFor(() => rowsOf(fork.id).length > 0)).toBe(true);
+    expect(await waitFor(() => rowsOf(unmarked.id).length > 0)).toBe(true);
+    expect(airRow(rowsOf(fork.id)[0]!).forkedFrom).toBe(parent.id);
+    await agent.dispose();
+  });
+
   it("sends a created session, a prompt and a turn end, but not updatedAt alone", async () => {
     const { rowsOf, changes, subscriptionId, agent } = await subscribedAgent();
     const session = await writeTranscript({ prompt: "First", lastMessageAt: Date.now() - 5000 });
@@ -1409,6 +2019,39 @@ describe("_session/list/subscribe", () => {
     expect(changes().flatMap((c) => c.sessions.map((s) => s.sessionId))).not.toContain(
       elsewhere.id,
     );
+    await agent.dispose();
+  });
+
+  it("marks the change rows of sessions in a worktree Claude Code made", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const user = path.join(workspace, "user");
+    await linkWorktrees(repo, made, user);
+    // The worktrees' project directories exist before the subscription.
+    await writeTranscript({ cwd: made });
+    await writeTranscript({ cwd: user });
+    const { rowsOf, agent } = await subscribedAgent(repo);
+    const madeId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inUser = await writeTranscript({ cwd: user });
+    expect(await waitFor(() => rowsOf(inMade.id).length > 0 && rowsOf(inUser.id).length > 0)).toBe(
+      true,
+    );
+    expect(agentWorktreeOfRow(rowsOf(inMade.id).at(-1))).toBe(true);
+    expect(agentWorktreeOfRow(rowsOf(inUser.id).at(-1))).toBeUndefined();
+    // The session leaves the worktree: the row changes and loses the field.
+    await fs.appendFile(inMade.file, JSON.stringify(worktreeState(madeId, null)) + "\n");
+    expect(
+      await waitFor(
+        () =>
+          rowsOf(inMade.id).length > 1 &&
+          agentWorktreeOfRow(rowsOf(inMade.id).at(-1)) === undefined,
+      ),
+    ).toBe(true);
     await agent.dispose();
   });
 
@@ -2008,17 +2651,12 @@ describe("a session that another process holds", () => {
 });
 
 describe("session/delete of an AIR client without sessionIndex", () => {
-  it("fails for an unknown session as the SDK delete did", async () => {
+  it("succeeds for an unknown session, as ACP asks", async () => {
     const { agent } = createAgent();
     await initializeClient(agent, air());
     for (const sessionId of [randomUUID(), "not-a-uuid"]) {
-      const sdkError = await vi.mocked(deleteSession).getMockImplementation()!(sessionId).then(
-        () => undefined,
-        (error: Error) => error,
-      );
-      expect(sdkError).toBeInstanceOf(Error);
       vi.mocked(deleteSession).mockClear();
-      await expect(agent.deleteSession({ sessionId })).rejects.toThrow(sdkError!.message);
+      await expect(agent.deleteSession({ sessionId })).resolves.toEqual({});
       expect(deleteSession).not.toHaveBeenCalled();
     }
   });
@@ -2360,14 +2998,13 @@ describe("empty transcripts on delete", () => {
     const dir = path.join(configDir, "projects", encodeProjectPath(workspace));
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, `${id}.jsonl`), "");
-    const sdkError = await sdkDelete()(id).then(
-      () => undefined,
-      (error: Error) => error,
-    );
+    // The SDK delete does not find an empty transcript, so there is nothing to
+    // archive: the delete succeeds and leaves the file as it is.
+    await expect(sdkDelete()(id)).rejects.toThrow("not found");
     const service = new SessionIndexService({
       logError: () => {},
     });
-    await expect(archiveInsteadOfDelete(id, service)).rejects.toThrow(sdkError!.message);
+    await expect(archiveInsteadOfDelete(id, service)).resolves.toBeUndefined();
     expect(await fs.readFile(path.join(dir, `${id}.jsonl`), "utf8")).toBe("");
   });
 });
@@ -2600,6 +3237,63 @@ describe("tail growth", () => {
     await fs.writeFile(file, `${big(id, at - 1000, 10)}\n${big(id, at, 2_000_000)}\n`);
     const { size } = await fs.stat(file);
     expect((await scanTranscriptFile(file, size)).lastMessageAt).toBe(at);
+  });
+
+  it("reads the worktree record of the tail, else of an earlier scan, else of the head", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    // `claude --worktree` writes the record at the start; 200 KB of
+    // messages push it out of the tail.
+    const messages = Array.from({ length: 20 }, (_, i) => big(id, at + i, 10_000)).join("\n");
+    const inHead = path.join(workspace, `${id}.jsonl`);
+    const headContent = `${record({ path: "/wt" })}\n${messages}\n`;
+    await fs.writeFile(inHead, headContent);
+    expect((await scanTranscriptFile(inHead, Buffer.byteLength(headContent))).agentWorktree).toBe(
+      true,
+    );
+    // A later record in the tail wins over the head.
+    const nullRecord = `${record(null)}\n`;
+    await fs.appendFile(inHead, nullRecord);
+    expect(
+      (await scanTranscriptFile(inHead, Buffer.byteLength(headContent + nullRecord))).agentWorktree,
+    ).toBe(false);
+    // The record an earlier scan found stands when the file grew within the
+    // tail and the new tail lost it, not the older one of the head.
+    const grown = path.join(workspace, `${randomUUID()}.jsonl`);
+    const before = `${record({ path: "/wt" })}\n${messages}\n${record(null)}\n${big(id, at + 50, 10_000)}\n`;
+    await fs.writeFile(grown, before);
+    const first = await scanTranscriptFile(grown, Buffer.byteLength(before));
+    expect(first.agentWorktree).toBe(false);
+    const appended = `${big(id, at + 100, 60_000)}\n`;
+    await fs.appendFile(grown, appended);
+    const second = await scanTranscriptFile(
+      grown,
+      Buffer.byteLength(before + appended),
+      undefined,
+      {
+        ...first,
+        size: Buffer.byteLength(before),
+      },
+    );
+    expect(second.agentWorktree).toBe(false);
+  });
+
+  it("takes the worktree record of a wider tail over the head's", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    const messages = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => big(id, at + from + i, 10_000)).join("\n");
+    // No prompt, so the tail grows; the null record lies beyond the 64 KB
+    // tail and the 64 KB head, within the 256 KB window.
+    const file = path.join(workspace, `${id}.jsonl`);
+    const content = `${record({ path: "/wt" })}\n${messages(0, 10)}\n${record(null)}\n${messages(100, 10)}\n`;
+    await fs.writeFile(file, content);
+    const facts = await scanTranscriptFile(file, Buffer.byteLength(content));
+    expect(facts.agentWorktree).toBe(false);
   });
 
   it("does not search a transcript of the same size again", async () => {
@@ -2947,7 +3641,7 @@ describe("archive state (ACP RFD #2161)", () => {
     // A prompt fails as for a closed session.
     await expect(
       agent.prompt({ sessionId: session.id, prompt: [{ type: "text", text: "go on" }] }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toMatchObject({ code: -32002, data: { sessionId: session.id } });
 
     // Unarchive does not reopen it, and reports nothing to the closed session.
     await agent.unarchiveSession({ sessionId: session.id });
@@ -3265,7 +3959,8 @@ describe("paths that share a project directory", () => {
         .filter((s) => s.sessionId === mine.id);
     const removed = () =>
       changesFor(notifications, fromDotted.subscriptionId).flatMap((c) => c.removed);
-    expect(await waitFor(() => added().length > 0 && removed().length > 0)).toBe(true);
+    // Wait for mine.id itself: the other path's session can be removed first.
+    expect(await waitFor(() => added().length > 0 && removed().includes(mine.id))).toBe(true);
     expect(added().map((s) => [s.sessionId, s.cwd])).toEqual([[mine.id, dashed]]);
     // It may also name the other path's session, never listed here.
     expect(removed()).toContain(mine.id);

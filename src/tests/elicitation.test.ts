@@ -3,7 +3,7 @@ import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
   EnumOption,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ElicitationRequest } from "@anthropic-ai/claude-agent-sdk";
 import {
   applyAskElicitationResponse,
@@ -59,6 +59,19 @@ describe("mcpElicitationToCreateRequest", () => {
       message: "Need your name",
       requestedSchema: { type: "object", properties: { name: { type: "string" } } },
     });
+  });
+
+  it("adds an empty properties map when the MCP schema has none", () => {
+    const request: ElicitationRequest = {
+      serverName: "server",
+      message: "Confirm?",
+      mode: "form",
+      requestedSchema: { type: "object" },
+    };
+
+    const result = mcpElicitationToCreateRequest(request, SESSION_ID);
+
+    expect(result).toMatchObject({ requestedSchema: { type: "object", properties: {} } });
   });
 
   it("maps a url-mode request and preserves the elicitation id", () => {
@@ -118,6 +131,31 @@ describe("createElicitationResponseToElicitResult", () => {
       action: "accept",
       content: {},
     });
+  });
+
+  it("forwards content values that only v2 allows, such as an object", () => {
+    // ACP v2 lets an elicitation value be any JSON value. The MCP server checks
+    // the content against its own schema, so none of it is dropped here.
+    const content = {
+      name: "Ada",
+      address: { city: "London" },
+      tags: ["a", 1, null],
+    };
+    const response = { action: "accept", content } as unknown as CreateElicitationResponse;
+    expect(createElicitationResponseToElicitResult(response)).toEqual({
+      action: "accept",
+      content,
+    });
+  });
+
+  it("maps accept content that is no JSON object to an empty object", () => {
+    for (const content of [null, "Ada", ["Ada"]]) {
+      const response = { action: "accept", content } as unknown as CreateElicitationResponse;
+      expect(createElicitationResponseToElicitResult(response)).toEqual({
+        action: "accept",
+        content: {},
+      });
+    }
   });
 
   it("maps decline and cancel", () => {
@@ -405,6 +443,28 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
+  it("reads only string, number, and boolean picks from v2 content", () => {
+    // A v2 client may send an object or a mixed array. Such values are no
+    // option label, so they count as no pick instead of "[object Object]".
+    const response = {
+      action: "accept",
+      content: {
+        question_0: { label: "A" },
+        question_0_custom: { text: "ignored" },
+        question_1: ["X", { label: "Y" }, null, 2],
+      },
+    } as unknown as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": "X, 2" },
+      },
+    });
+  });
+
   it("uses a multi-select question's custom answer alone when nothing is selected", () => {
     const response = {
       action: "accept",
@@ -591,6 +651,48 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
+  it("marks every question dismissed on decline when reportUnanswered is set", () => {
+    const response = { action: "decline" } as CreateElicitationResponse;
+    expect(
+      applyAskElicitationResponse(response, toolInput, questions, { reportUnanswered: true }),
+    ).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: {},
+        annotations: {
+          "Single?": { unanswered: "dismissed" },
+          "Multi?": { unanswered: "dismissed" },
+        },
+      },
+    });
+  });
+
+  it("marks blank questions skipped on accept when reportUnanswered is set", () => {
+    const response = {
+      action: "accept",
+      content: { question_0: "A", question_0_note: "note", question_1: [] },
+    } as CreateElicitationResponse;
+    expect(
+      applyAskElicitationResponse(response, toolInput, questions, {
+        reportUnanswered: true,
+        answerNotes: true,
+      }),
+    ).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "A" },
+        annotations: {
+          "Single?": { notes: "note" },
+          "Multi?": { unanswered: "skipped" },
+        },
+      },
+    });
+  });
+
   it("returns cancel on cancel", () => {
     const response = { action: "cancel" } as CreateElicitationResponse;
     expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
@@ -710,10 +812,12 @@ describe("refusalFallbackResultFromResponse", () => {
       { action: "accept", content: { choice: "cancelled" } },
       { action: "accept", content: {} },
       { action: "accept", content: { choice: "something-new" } },
+      { action: "accept", content: { choice: { value: "retry_fallback" } } },
+      { action: "accept", content: { choice: ["retry_fallback"] } },
       { action: "accept" },
       { action: "decline" },
       { action: "cancel" },
-    ] as CreateElicitationResponse[];
+    ] as unknown as CreateElicitationResponse[];
     for (const response of cases) {
       expect(refusalFallbackResultFromResponse(response)).toBe("cancelled");
     }

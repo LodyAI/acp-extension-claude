@@ -55,6 +55,7 @@ export class SettingsManager {
   private effective: Settings = {};
   private managedDeniedModels: string[] = [];
   private managedSettings: Settings = {};
+  private managedApiKeyHelper?: string;
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -131,11 +132,16 @@ export class SettingsManager {
       this.managedDeniedModels = resolved.sources
         .filter((entry) => entry.source === "managed")
         .flatMap((entry) => entry.settings.deniedModels ?? []);
+      this.managedApiKeyHelper =
+        resolved.provenance.apiKeyHelper?.source === "managed"
+          ? resolved.effective.apiKeyHelper
+          : undefined;
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
       this.managedDeniedModels = [];
       this.managedSettings = {};
+      this.managedApiKeyHelper = undefined;
     }
   }
 
@@ -196,6 +202,16 @@ export class SettingsManager {
    */
   getSettings(): Settings {
     return this.effective;
+  }
+
+  /**
+   * The `apiKeyHelper` the CLI runs: managed settings outrank the `--settings`
+   * override, which outranks the user/project/local files.
+   */
+  getApiKeyHelper(settingsOverride?: Settings): string | undefined {
+    return (
+      this.managedApiKeyHelper ?? settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper
+    );
   }
 
   /**

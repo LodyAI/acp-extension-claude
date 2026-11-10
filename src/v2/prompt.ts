@@ -10,34 +10,23 @@ import {
   type ContentBlock,
   type PromptRequest,
   type Role,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
-import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
+import { isSupportedBlobMimeType } from "../blob-resources.js";
+import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
  * Starts a turn for `params`, and answers when Claude Code takes the prompt
- * in. `send` delivers a session update of the prompt's session; it must not
- * throw, and must deliver updates in the order it is called, also relative to
- * the agent's own updates.
+ * in, with the id of the user message it became. `send` delivers a session
+ * update of the prompt's session; it must not throw, and must deliver updates
+ * in the order it is called, also relative to the agent's own updates.
  *
- * - Taken in: the prompt's `user_message`, then `running`, then the answer.
- * - Waiting on a permission request or a question: `requires_action`, and
- *   `running` once none is open.
- * - Ended: `idle` with the stop reason, usage, and `_meta` of the turn.
- * - Failed after it was taken in: `idle` with the `error` stop reason and the
- *   JSON-RPC error that v1 answers the prompt with, so a client can show its
- *   message and handle its code as for an error response (for example,
- *   `-32000` starts the client's sign-in).
+ * - Taken in: the prompt's `user_message`, then the answer. From then on, the
+ *   turn is the session's foreground work, which reports its states (see
+ *   {@link v2Foreground}).
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
- *
- * Deferred decision: a turn whose background subagents still run ends only
- * when they finish (`Turn.deferredSettle`), so `idle` waits for them too. The
- * hold exists for v1, whose clients stop listening at the prompt response.
- * v2 allows background updates while idle, so it could report `idle` at the
- * turn's result instead, with a turn event for the hold. To be decided with
- * async tasks (step 6 in `docs/acp-v2.md`).
  */
 export function v2Prompt(
   agent: ClaudeAcpAgent,
@@ -50,40 +39,21 @@ export function v2Prompt(
       inserted(messageId) {
         inserted = true;
         send({ sessionUpdate: "user_message", messageId, content: params.prompt });
-        send({ sessionUpdate: "state_update", state: "running" });
         resolve({ messageId });
       },
-      awaitingUser() {
-        send({ sessionUpdate: "state_update", state: "requires_action" });
-      },
-      resumed() {
-        send({ sessionUpdate: "state_update", state: "running" });
-      },
       ended(outcome) {
-        if (inserted) {
-          send(idle(outcome));
-        } else if (outcome.stopReason === "cancelled") {
-          reject(RequestError.requestCancelled());
-        } else {
-          reject(
-            RequestError.internalError(
-              { stopReason: outcome.stopReason },
-              "The turn ended before Claude Code took the prompt in",
-            ),
-          );
-        }
+        if (inserted) return;
+        reject(
+          outcome.stopReason === "cancelled"
+            ? RequestError.requestCancelled()
+            : RequestError.internalError(
+                { stopReason: outcome.stopReason },
+                "The turn ended before Claude Code took the prompt in",
+              ),
+        );
       },
       failed(error) {
-        if (!inserted) {
-          reject(error);
-          return;
-        }
-        send({
-          sessionUpdate: "state_update",
-          state: "idle",
-          stopReason: "error",
-          error: jsonRpcError(error),
-        });
+        if (!inserted) reject(error);
       },
     };
     let request: PromptRequest;
@@ -95,6 +65,50 @@ export function v2Prompt(
     }
     agent.startTurn(request, events).catch(reject);
   });
+}
+
+/**
+ * Reports the foreground work of a session (see {@link ForegroundEvents}) as
+ * its `state_update`s. `send` delivers a session update of that session, as
+ * for {@link v2Prompt}.
+ *
+ * - Started: `running`. For a prompt's turn, right after its `user_message`.
+ * - Waiting on a permission request or a question: `requires_action`, and
+ *   `running` once none is open, unless a cancel withdrew the last one: the
+ *   work is being stopped then, and its `idle` follows.
+ * - Ended: `idle` with the stop reason, usage, and `_meta` of the work.
+ * - Failed: `idle` with the `error` stop reason and the JSON-RPC error that v1
+ *   answers the prompt with, so a client can show its message and handle its
+ *   code as for an error response (for example, `-32000` starts the client's
+ *   sign-in).
+ *
+ * The work is a prompt's turn or a model cycle that Claude Code started on its
+ * own, such as its follow-up after a background subagent finished. A turn's
+ * work ends at its result, also when v1 holds the turn's answer for the
+ * background subagents it spawned (`Turn.deferredSettle`): v2 allows
+ * background updates while idle, so the subagents' output and requests arrive
+ * after `idle`, and their follow-up is a cycle of its own.
+ */
+export function v2Foreground(send: (update: v2.SessionUpdate) => void): ForegroundEvents {
+  return {
+    running() {
+      send({ sessionUpdate: "state_update", state: "running" });
+    },
+    awaitingUser() {
+      send({ sessionUpdate: "state_update", state: "requires_action" });
+    },
+    ended(outcome) {
+      send(idle(outcome));
+    },
+    failed(error) {
+      send({
+        sessionUpdate: "state_update",
+        state: "idle",
+        stopReason: "error",
+        error: jsonRpcError(error),
+      });
+    },
+  };
 }
 
 /** The JSON-RPC error that v1 answers a failed prompt with. */
@@ -128,19 +142,42 @@ function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
 }
 
 /**
- * A v2 prompt may hold content blocks that v1 cannot express: a custom one,
- * or one from a newer ACP version. Clients send only the kinds the agent
- * advertised, so such a block is rejected rather than silently dropped.
+ * A v2 prompt may hold content blocks that the agent does not take: audio,
+ * which it does not advertise and Claude cannot read, a custom one, or one
+ * from a newer ACP version. Clients send only the kinds the agent advertised,
+ * so such a block fails the request with invalid params (-32602) rather than
+ * being dropped from the prompt. The same goes for an embedded blob that
+ * Claude cannot read, e.g. an `application/zip` resource: `promptToClaude`
+ * would drop it. An empty `prompt` fails the same way: v2 requires at least
+ * one content block.
  */
 export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
-  return { ...request, prompt: prompt.map(v1ContentBlock) };
+  if (prompt.length === 0) {
+    throw RequestError.invalidParams({ prompt }, "`prompt` must hold at least one content block");
+  }
+  return {
+    ...request,
+    prompt: prompt.map((block) => {
+      if (
+        v2.ContentBlock.isResource(block) &&
+        "blob" in block.resource &&
+        !isSupportedBlobMimeType(block.resource.mimeType)
+      ) {
+        const mimeType = block.resource.mimeType ?? null;
+        throw RequestError.invalidParams(
+          { uri: block.resource.uri, mimeType },
+          `Embedded blob resources of type ${mimeType ?? "unknown"} are not supported`,
+        );
+      }
+      return v1ContentBlock(block);
+    }),
+  };
 }
 
-function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
+export function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
   if (
     v2.ContentBlock.isText(block) ||
     v2.ContentBlock.isImage(block) ||
-    v2.ContentBlock.isAudio(block) ||
     v2.ContentBlock.isResourceLink(block) ||
     v2.ContentBlock.isResource(block)
   ) {

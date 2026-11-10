@@ -7,7 +7,6 @@ const usesRealCli =
 export default defineConfig({
   test: {
     watch: false,
-    setupFiles: usesRealCli ? [] : ["src/tests/network-setup.ts"],
     globals: true,
     environment: "node",
     // The agent runs `claude auth status` in the background on every
@@ -15,6 +14,12 @@ export default defineConfig({
     // tests off the machine's real CLI and Claude config, and stops a run
     // from outliving its test (it wrote into temp config dirs being deleted).
     env: usesRealCli ? {} : { CLAUDE_CODE_EXECUTABLE: "/usr/bin/false" },
+    // Applies to real-CLI runs too: the gateway listing runs in the test process,
+    // and tests point `providers/set` at fake URLs like gateway.example.com.
+    setupFiles: [
+      ...(usesRealCli ? [] : ["src/tests/network-setup.ts"]),
+      "src/tests/setup-no-network.ts",
+    ],
     include: [
       "src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}",
       // Release tooling lives in scripts/ rather than src/ so it stays outside tsc's
