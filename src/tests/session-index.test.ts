@@ -55,6 +55,22 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   };
 });
 
+/** Holds a transcript append whose records `hold` returns a promise for. */
+const appendGate = vi.hoisted(() => ({
+  hold: undefined as ((data: string) => Promise<void> | undefined) | undefined,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    appendFile: async (...args: Parameters<typeof actual.appendFile>) => {
+      await appendGate.hold?.(String(args[1]));
+      return actual.appendFile(...args);
+    },
+  };
+});
+
 const air = (...capabilities: string[]) => ({
   _meta: { jetbrains: { air: { version: 1, capabilities } } },
 });
@@ -692,14 +708,36 @@ describe("Core archive without AIR negotiation", () => {
     await agent.dispose();
   });
 
-  it("orders a Core archive after an AIR rename already in flight", async () => {
+  it("queues a Core archive behind an AIR rename that read the unarchived title", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
-    const rename = agent.renameSessionTitle({ sessionId: session.id, title: "Renamed" });
-    const archive = agent.setLodySessionArchived(session.id, true);
-    await Promise.all([rename, archive]);
-    expect((await getSessionInfo(session.id))?.customTitle).toBe("[archived] Renamed");
-    await agent.dispose();
+    let renameRead!: () => void;
+    const read = new Promise<void>((resolve) => (renameRead = resolve));
+    let releaseRename!: () => void;
+    const released = new Promise<void>((resolve) => (releaseRename = resolve));
+    // The rename has read the title and holds its append.
+    appendGate.hold = (data) => {
+      if (!data.includes('"Renamed"')) return undefined;
+      appendGate.hold = undefined;
+      renameRead();
+      return released;
+    };
+    try {
+      const rename = agent.renameSessionTitle({ sessionId: session.id, title: "Renamed" });
+      await read;
+      const mutations = (agent as any).sessionIndex.service.mutations as Map<string, unknown>;
+      const pending = mutations.get(session.id);
+      const archive = agent.setLodySessionArchived(session.id, true);
+      // A separate queue would let the archive write before the held rename.
+      expect(mutations.get(session.id)).not.toBe(pending);
+      releaseRename();
+      await Promise.all([rename, archive]);
+      expect((await getSessionInfo(session.id))?.customTitle).toBe("[archived] Renamed");
+    } finally {
+      appendGate.hold = undefined;
+      releaseRename();
+      await agent.dispose();
+    }
   });
 
   it("rejects a missing transcript rather than creating history", async () => {
