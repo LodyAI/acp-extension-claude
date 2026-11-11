@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { claudeConfigDir } from "../paths.js";
 import { resolveSkillPath } from "../tool-calls/reporters/interaction.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -38,6 +39,7 @@ describe("skill manifest read errors", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    delete process.env.CLAUDE_CONFIG_DIR;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -101,4 +103,41 @@ describe("skill manifest read errors", () => {
       expect(resolveSkillPath("review", root)).toBe(file);
     },
   );
+
+  it("expands ~, $HOME, and ${HOME} in claudeConfigDir() and falls back to ~/.claude when blank", () => {
+    const home = path.join(root, "home");
+    process.env.CLAUDE_CONFIG_DIR = "  ~/.claude-work  ";
+    expect(claudeConfigDir()).toBe(path.join(home, ".claude-work"));
+    process.env.CLAUDE_CONFIG_DIR = "$HOME/.claude-work";
+    expect(claudeConfigDir()).toBe(path.join(home, ".claude-work"));
+    process.env.CLAUDE_CONFIG_DIR = "${HOME}/.claude-work";
+    expect(claudeConfigDir()).toBe(path.join(home, ".claude-work"));
+    process.env.CLAUDE_CONFIG_DIR = "   ";
+    expect(claudeConfigDir()).toBe(path.join(home, ".claude"));
+  });
+
+  it("resolves user-level skills, plugins, marketplaces, and commands from CLAUDE_CONFIG_DIR", () => {
+    process.env.CLAUDE_CONFIG_DIR = "~/.claude-custom";
+    const skillFile = writeSkill(
+      "home/.claude-custom/skills/custom-skill",
+      "---\nname: custom-skill\n---\n",
+    );
+    const pluginFile = writeSkill(
+      "home/.claude-custom/plugins/reviewer/skills/audit",
+      "---\nname: audit\n---\n",
+    );
+    const marketplaceFile = writeSkill(
+      "home/.claude-custom/plugins/marketplaces/official/plugins/linter/skills/check",
+      "---\nname: check\n---\n",
+    );
+    expect(resolveSkillPath("custom-skill", root)).toBe(skillFile);
+    expect(resolveSkillPath("reviewer:audit", root)).toBe(pluginFile);
+    expect(resolveSkillPath("linter:check", root)).toBe(marketplaceFile);
+
+    writeSkill(".agents/skills/other", "---\nname: deploy\n---\n");
+    const cmdFile = path.join(root, "home/.claude-custom/commands/deploy.md");
+    mkdirSync(path.dirname(cmdFile), { recursive: true });
+    writeFileSync(cmdFile, "# prompt\n");
+    expect(resolveSkillPath("deploy", root)).toBeUndefined();
+  });
 });

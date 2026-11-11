@@ -1,6 +1,6 @@
 import type { PermissionOption } from "@agentclientprotocol/sdk/unstable";
-import os from "node:os";
 import path from "node:path";
+import { claudeConfigDir } from "../../paths.js";
 import type { DurablePermissionChangeSet } from "../normalization.js";
 import { plainString, type PermissionOptionContext, withOptionalUpdate } from "./shared.js";
 
@@ -109,7 +109,7 @@ function fileSessionLabel(
     operation === "write" &&
     !!resolvedFilePath &&
     (isInside(path.join(context.cwd, ".claude"), resolvedFilePath) ||
-      isInside(path.join(os.homedir(), ".claude"), resolvedFilePath));
+      isInside(claudeConfigDir(), resolvedFilePath));
   const broadRule = hasBroadSessionAllowRuleFor(
     context.durableChangeSet!,
     operation === "read" ? "Read" : "Edit",

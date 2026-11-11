@@ -9,6 +9,7 @@ import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
 import { z } from "zod";
 import type { ModelUsage as SdkModelUsage } from "@anthropic-ai/claude-agent-sdk";
 import { sumModelUsage, type ModelUsage } from "acp-extension-core";
+import { claudeConfigDir } from "./paths.js";
 import type { ResumedUsageBaseline } from "./resumed-session.js";
 
 /** SDK thinking is a subset of output; costBasis=unknown is a guessed rate,
@@ -278,12 +279,16 @@ export async function getUsage(
   }
 }
 
+function resolveClaudeDir(homeDir: string): string {
+  return process.env.CLAUDE_CONFIG_DIR?.trim() ? claudeConfigDir() : path.join(homeDir, ".claude");
+}
+
 /**
  * Get path for keychain failure backoff cache.
  * Separate from usage cache to track keychain-specific failures.
  */
 function getKeychainBackoffPath(homeDir: string): string {
-  return path.join(homeDir, ".claude", "plugins", "claude-hud", ".keychain-backoff");
+  return path.join(resolveClaudeDir(homeDir), "plugins", "claude-hud", ".keychain-backoff");
 }
 
 /**
@@ -368,7 +373,7 @@ function readFileCredentials(
   homeDir: string,
   now: number,
 ): { accessToken: string; subscriptionType: string } | null {
-  const credentialsPath = path.join(homeDir, ".claude", ".credentials.json");
+  const credentialsPath = path.join(resolveClaudeDir(homeDir), ".credentials.json");
 
   if (!fs.existsSync(credentialsPath)) {
     return null;

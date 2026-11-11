@@ -17,6 +17,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { exitPlanModeRawOutput } from "../../exit-plan.js";
+import { claudeConfigDir } from "../../paths.js";
 import { textContent, toAcpContentUpdate } from "../content.js";
 import type {
   ToolReporter,
@@ -437,6 +438,8 @@ export function resolveSkillPath(
   ) {
     return undefined;
   }
+  const homeDir = os.homedir();
+  const userClaudeDir = claudeConfigDir();
   const containers: string[] = [];
   const addContainers = (base: string) => {
     for (const container of SKILL_CONTAINER_DIRS) {
@@ -444,14 +447,14 @@ export function resolveSkillPath(
     }
   };
   // A `<prefix>:<name>` skill is either directory-scoped or a plugin's; both spellings look identical.
-  const addScopedContainers = (base: string) => {
+  const addScopedContainers = (base: string, claudeDir = path.join(base, ".claude")) => {
     if (scope === undefined) {
       return;
     }
     addContainers(path.join(base, scope));
-    containers.push(path.join(base, ".claude/plugins", scope, "skills"));
+    containers.push(path.join(claudeDir, "plugins", scope, "skills"));
     // An installed plugin lives under the marketplace it came from, which its `<prefix>` does not name.
-    const marketplaces = path.join(base, ".claude/plugins/marketplaces");
+    const marketplaces = path.join(claudeDir, "plugins/marketplaces");
     let installed: string[];
     try {
       installed = readdirSync(marketplaces).sort();
@@ -463,9 +466,9 @@ export function resolveSkillPath(
     }
   };
   addScopedContainers(cwd);
-  addScopedContainers(os.homedir());
+  addScopedContainers(homeDir, userClaudeDir);
   addContainers(cwd);
-  addContainers(os.homedir());
+  containers.push(path.join(userClaudeDir, "skills"), path.join(homeDir, ".agents/skills"));
   for (const container of containers) {
     const candidate = path.join(container, name, "SKILL.md");
     let stats: Stats;
@@ -486,8 +489,8 @@ export function resolveSkillPath(
   // declares it somewhere else. Only the directory probe above may answer for it, by the name it carries.
   if (
     scope === undefined &&
-    [cwd, os.homedir()].some((base) =>
-      existsSync(path.join(base, ".claude/commands", `${name}.md`)),
+    [path.join(cwd, ".claude"), userClaudeDir].some((claudeDir) =>
+      existsSync(path.join(claudeDir, "commands", `${name}.md`)),
     )
   ) {
     return undefined;

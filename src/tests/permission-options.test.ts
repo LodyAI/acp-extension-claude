@@ -456,6 +456,30 @@ describe("Claude permission options and response mapping", () => {
     );
   });
 
+  it("uses Claude Code's special session label for CLAUDE_CONFIG_DIR settings", () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = "/custom/claude-profile";
+    try {
+      const changeSet = normalizeDurablePermissionChangeSet([
+        {
+          type: "addRules",
+          rules: [{ toolName: "Edit", ruleContent: "/custom/claude-profile/**" }],
+          behavior: "allow",
+          destination: "session",
+        },
+      ]);
+      expect(
+        build("Edit", changeSet, { file_path: "/custom/claude-profile/settings.json" })[1]?.name,
+      ).toBe("Yes, and allow Claude to edit its own settings for this session");
+    } finally {
+      if (prev === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = prev;
+      }
+    }
+  });
+
   it("builds Claude Code's exact and prefix Skill options from tool input", () => {
     expect(build("Skill", undefined, { skill: "deploy prod" })).toMatchObject([
       { optionId: PERMISSION_OPTION_ID.allowOnce, name: "Yes" },
