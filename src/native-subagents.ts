@@ -12,6 +12,7 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODEL_CONFIG_ID } from "./session-model.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
 
@@ -297,6 +298,20 @@ export class NativeSubagentRuntime {
             cancel: false,
           },
         });
+      } else if (update.sessionUpdate === "config_option_update") {
+        const selected = (id: string) => {
+          const option = update.configOptions.find((candidate) => candidate.id === id);
+          return option?.type === "select" && typeof option.currentValue === "string"
+            ? option.currentValue
+            : undefined;
+        };
+        const configuration = {
+          modelId: selected(MODEL_CONFIG_ID),
+          reasoningEffort: selected(EFFORT_CONFIG_ID),
+        };
+        if (configuration.modelId || configuration.reasoningEffort) {
+          await this.lody.snapshot(notification.sessionId, configuration);
+        }
       } else if (update.sessionUpdate === "subagent_state_update") {
         await this.lody.snapshot(update.subagentSessionId, {
           state: update.state === "disconnected" ? "unknown" : update.state,

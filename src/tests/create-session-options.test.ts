@@ -6,6 +6,7 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { getSessionMessages, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { isLodySubagentEvent, type LodySubagentEvent } from "acp-extension-core";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { fetch as gatewayFetch } from "undici";
 import type { AcpSessionNotification } from "../acp-subagents.js";
@@ -630,6 +631,57 @@ describe("createSession options merging", () => {
         .filter(({ update }) => update.sessionUpdate === "config_option_update")
         .every(({ sessionId: target }) => target === "child"),
     ).toBe(true);
+  });
+
+  it("reports child settings through hooks when only Lody subagent events are negotiated", async () => {
+    agent.clientCapabilities = { _meta: { lody: { subagentEvents: { version: 1 } } } };
+    const cwd = process.cwd();
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const session = agent.sessions[sessionId]!;
+    const events: LodySubagentEvent[] = [];
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      undefined,
+      sessionId,
+      session,
+      async () => {},
+      { log: () => {} },
+      undefined,
+      undefined,
+      undefined,
+      async (event) => {
+        events.push(event);
+      },
+    ));
+    const hook = capturedOptions?.hooks?.PostModelSwitch?.[0]?.hooks[0];
+    if (!hook) throw new Error("Missing child configuration hook");
+    await hook(
+      {
+        hook_event_name: "PostModelSwitch",
+        session_id: sessionId,
+        agent_id: "worker",
+        cwd,
+        transcript_path: "/tmp/synthetic-transcript",
+        to_model: "child-model",
+        source: "auto",
+        effort: { level: "high" },
+      } as Parameters<typeof hook>[0],
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    expect(events).toEqual([]);
+    await runtime.taskStarted({ taskId: "worker", subagentType: "Explore" }, async () => {});
+    const modelMetadata = { modelId: "child-model", reasoningEffort: "high" };
+    expect(events.at(-1)).toMatchObject({
+      sessionId,
+      snapshot: { state: "running", ...modelMetadata },
+    });
+    await runtime.finishTask("worker", "completed", async () => {});
+    expect(events.at(-1)).toMatchObject({
+      sessionId,
+      runId: events[0]?.runId,
+      snapshot: { state: "completed", ...modelMetadata },
+    });
+    expect(events.every(isLodySubagentEvent)).toBe(true);
   });
 
   it("reports a worktree child's cwd from its SubagentStart hook, and none for a child in the session's cwd", async () => {
