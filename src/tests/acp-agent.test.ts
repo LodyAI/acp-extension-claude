@@ -15889,29 +15889,44 @@ describe("getOrCreateSession param change detection", () => {
     expect(session.settingsManager.dispose).not.toHaveBeenCalled();
   });
 
-  it("tears down the existing session when any other Claude option changes", async () => {
-    const agent = createMockAgent();
-    const session = injectSession(agent, "s1", {
-      cwd: "/project",
-      options: { env: { CUSTOM_ENV: "original" } },
-    });
-    const createSessionSpy = vi
-      .spyOn(agent as any, "createSession")
-      .mockRejectedValue(new Error("mock"));
-
-    await expect(
-      agent.resumeSession({
-        sessionId: "s1",
+  it.each<{ label: string; previousOptions: Options; nextOptions: Options }>([
+    {
+      label: "environment",
+      previousOptions: { env: { CUSTOM_ENV: "original" } },
+      nextOptions: { env: { CUSTOM_ENV: "changed" } },
+    },
+    {
+      label: "MCP delivery",
+      previousOptions: { mcpServersDelivery: "argv" },
+      nextOptions: { mcpServersDelivery: "initialize" },
+    },
+  ])(
+    "tears down the existing session when $label changes",
+    async ({ previousOptions, nextOptions }) => {
+      const agent = createMockAgent();
+      const session = injectSession(agent, "s1", {
         cwd: "/project",
-        mcpServers: [],
-        _meta: { claudeCode: { options: { env: { CUSTOM_ENV: "changed" } } } },
-      }),
-    ).rejects.toThrow("mock");
+        options: previousOptions,
+      });
+      const createSessionSpy = vi
+        .spyOn(agent as any, "createSession")
+        .mockRejectedValue(new Error("mock"));
 
-    expect(session.settingsManager.dispose).toHaveBeenCalled();
-    expect(agent.sessions["s1"]).toBeUndefined();
-    expect(createSessionSpy).toHaveBeenCalled();
-  });
+      await expect(
+        agent.resumeSession({
+          sessionId: "s1",
+          cwd: "/project",
+          mcpServers: [],
+          _meta: { claudeCode: { options: nextOptions } },
+        }),
+      ).rejects.toThrow("mock");
+
+      expect(session.settingsManager.dispose).toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect(agent.sessions["s1"]).toBeUndefined();
+      expect(createSessionSpy).toHaveBeenCalled();
+    },
+  );
 
   it("tears down the existing session when additionalDirectories change", async () => {
     const agent = createMockAgent();

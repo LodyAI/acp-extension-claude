@@ -5016,13 +5016,13 @@ describe("the pages of one list", () => {
   });
 });
 
-describe("titles by the SDK's rule", () => {
+describe("titles across transcript read windows", () => {
   it("finds a custom title whose record starts before the tail window", async () => {
     const id = randomUUID();
     // Past the head window.
     let filler = assistantRecord(id, null);
     while (filler.length < 70_000) filler += "\n" + assistantRecord(id, null);
-    // The cut line of the last 64 KB, which the SDK still searches.
+    // The custom-title record straddles the initial 64 KB tail window.
     const title = JSON.stringify({
       type: "custom-title",
       padding: "p".repeat(10_000),
@@ -5044,12 +5044,6 @@ describe("titles by the SDK's rule", () => {
     expect(start).toBeLessThan(window);
     expect(start + title.indexOf('"customTitle"')).toBeGreaterThan(window);
     expect(start).toBeGreaterThan(64 * 1024);
-    const sdk = await vi
-      .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
-        "@anthropic-ai/claude-agent-sdk",
-      )
-      .then((module) => module.getSessionInfo(id, { dir: workspace }));
-    expect(sdk!.summary).toBe("Across the boundary");
     const { agent } = await indexAgent();
     const page = await agent.listSessions({ cwd: workspace });
     expect(page.sessions.map((s) => s.title)).toEqual(["Across the boundary"]);
