@@ -1365,6 +1365,14 @@ describe("ACP v2 prompts", () => {
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // The turn is on the active chain, where Claude Code's resumeSessionAt finds it.
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", turnId, {
+          id: "msg_turn",
+          role: "assistant",
+          content: [{ type: "text", text: "Answer" }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
       const fork = await agent.request(v2.methods.agent.session.fork, {
         sessionId,
         cwd,
