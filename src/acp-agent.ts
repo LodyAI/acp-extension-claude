@@ -217,7 +217,7 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
-import { forkSession } from "./fork-session.js";
+import { forkSession, resolveTurnForkSource } from "./fork-session.js";
 import {
   clientSystemPrompt,
   sdkSystemPrompt,
@@ -3418,6 +3418,11 @@ export class ClaudeAcpAgent {
     await this.validateCwd(params.cwd, params.additionalDirectories);
     const forkTurnId = getLodyForkTurnId(params._meta);
     if (forkTurnId) {
+      const source = await resolveTurnForkSource(params.sessionId, forkTurnId);
+      // A copied transcript is already on disk: hold it back before it starts.
+      if (source.copiedSessionId) {
+        this.sessionIndex.onForkCreated(params.sessionId, source.copiedSessionId);
+      }
       const response = await this.createSession(
         {
           cwd: params.cwd,
@@ -3426,11 +3431,7 @@ export class ClaudeAcpAgent {
           systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
-        {
-          resume: params.sessionId,
-          forkSession: true,
-          resumeSessionAt: forkTurnId,
-        },
+        source.creation,
       );
       this.sessionIndex.onForkCreated(params.sessionId, response.sessionId);
       this.afterSetupResponse(response.sessionId, params.mcpServers ?? []);

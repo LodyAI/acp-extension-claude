@@ -38,7 +38,8 @@ removed by the fork after that synchronization.
 - Keep cumulative per-model usage accounting, resumed cost baselines, unknown-cost
   propagation, and already-billed usage on cancellation.
 - Keep `_meta.lody.turnId` as the SDK assistant UUID and pass it directly to
-  `resumeSessionAt`; no in-memory message-ID mapping is maintained.
+  `resumeSessionAt`, or copy the transcript up to it when a compaction moved it
+  off the active chain; no in-memory message-ID mapping is maintained.
 - Keep negotiated Core subagent events, ancestry, permission attribution, answer
   notes, and tool/activity metadata.
 - Goals retain Core metadata and the `_lody/session/goal` control method. AIR

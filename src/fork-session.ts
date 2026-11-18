@@ -204,6 +204,51 @@ export async function forkSession(
   }
 }
 
+/** Where a Lody `forkAtTurn` fork starts: the `createSession` resume options. */
+export type TurnForkSource = {
+  creation: { resume: string; forkSession?: true; resumeSessionAt?: string };
+  /** The new session the transcript was copied into, when it was copied. */
+  copiedSessionId?: string;
+};
+
+/**
+ * Resolves the start of a fork at `turnId`, the SDK assistant uuid that Lody
+ * received as `_meta.lody.turnId`.
+ *
+ * Claude Code's `resumeSessionAt` looks the uuid up only on the active chain,
+ * which starts at the latest `compact_boundary`. After a compaction (an
+ * automatic one, `/compact`, or the adapter's idle compaction), a turn that
+ * ended before it fails with "No message found with message.uuid of: <id>".
+ * The transcript file still holds that turn, so the SDK copies it up to the
+ * turn into a new session instead. The copy gets new message uuids, so it is
+ * made only when `resumeSessionAt` cannot find the turn.
+ */
+export async function resolveTurnForkSource(
+  sessionId: string,
+  turnId: string,
+): Promise<TurnForkSource> {
+  try {
+    const activeChain = await getSessionMessages(sessionId);
+    if (activeChain.some((message) => message.uuid === turnId)) {
+      return { creation: { resume: sessionId, forkSession: true, resumeSessionAt: turnId } };
+    }
+    const transcript = await loadFullSessionHistory(sessionId);
+    if (!transcript.some((entry) => entry.uuid === turnId)) {
+      throw RequestError.invalidParams(
+        { turnId },
+        `Fork turn ${turnId} was not found in session ${sessionId}. Fork at a turn of this session instead.`,
+      );
+    }
+    const copied = await forkClaudeSession(sessionId, { upToMessageId: turnId });
+    return { creation: { resume: copied.sessionId }, copiedSessionId: copied.sessionId };
+  } catch (error) {
+    if (isUnknownSessionError(error, sessionId)) {
+      throw RequestError.sessionNotFound(sessionId);
+    }
+    throw error;
+  }
+}
+
 async function forkTranscript(
   params: ForkSessionRequest,
   dependencies: ForkSessionDependencies,
