@@ -341,11 +341,26 @@ function readKeychainCredentials(
   try {
     // Read from macOS Keychain using security command
     // Security: Use execFileSync with absolute path and args array (no shell)
-    const keychainData = execFileSync(
-      "/usr/bin/security",
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: KEYCHAIN_TIMEOUT_MS },
-    ).trim();
+    const findPassword = (accountArgs: string[]) =>
+      execFileSync(
+        "/usr/bin/security",
+        ["find-generic-password", "-s", "Claude Code-credentials", ...accountArgs, "-w"],
+        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: KEYCHAIN_TIMEOUT_MS },
+      ).trim();
+
+    // Claude Code reads its entry with `-a $USER` (the OS user name when unset).
+    // Without `-a`, `security` returns the first matching entry, which can belong
+    // to another account, e.g. an expired one migrated from another Mac. Fall
+    // back to that lookup only when the current account has no entry (exit 44).
+    let keychainData: string;
+    try {
+      keychainData = findPassword(["-a", process.env.USER || os.userInfo().username]);
+    } catch (error) {
+      if ((error as { status?: unknown }).status !== 44) {
+        throw error;
+      }
+      keychainData = findPassword([]);
+    }
 
     if (!keychainData) {
       return null;
