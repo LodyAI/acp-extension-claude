@@ -3,13 +3,14 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as https from "https";
 import { execFileSync } from "child_process";
+import { type EnvHttpProxyAgent, fetch } from "undici";
 import type { RateLimitWindow, RateLimitsSnapshot } from "acp-extension-core";
 import { z } from "zod";
 import type { ModelUsage as SdkModelUsage } from "@anthropic-ai/claude-agent-sdk";
 import { sumModelUsage, type ModelUsage } from "acp-extension-core";
 import type { ResumedUsageBaseline } from "./resumed-session.js";
+import { createEnvHttpDispatcher } from "./env-http-dispatcher.js";
 
 /** SDK thinking is a subset of output; costBasis=unknown is a guessed rate,
  * not a known cost. Callers must also remember earlier unknown costs in a query. */
@@ -163,6 +164,7 @@ const ScopedWeeklyLimitSchema = z.object({
 });
 
 const KEYCHAIN_TIMEOUT_MS = 5000;
+const USAGE_API_TIMEOUT_MS = 5000;
 const KEYCHAIN_BACKOFF_MS = 60_000; // Backoff on keychain failures to avoid re-prompting
 
 // Dependency injection for testing
@@ -493,50 +495,33 @@ function parseDate(dateStr: string | undefined): number | null {
   return Math.floor(date.getTime() / 1000);
 }
 
-function fetchUsageApi(accessToken: string): Promise<UsageApiResponse | null> {
-  return new Promise((resolve) => {
-    const options = {
-      hostname: "api.anthropic.com",
-      path: "/api/oauth/usage",
-      method: "GET",
+/** Requests go through `env`'s proxy (see `createEnvHttpDispatcher`); any failure returns null. */
+export async function fetchUsageApi(
+  accessToken: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<UsageApiResponse | null> {
+  let dispatcher: EnvHttpProxyAgent | undefined;
+  try {
+    dispatcher = await createEnvHttpDispatcher(env);
+    const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-hud/1.0",
       },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-
-      res.on("data", (chunk: Buffer) => {
-        data += chunk.toString();
-      });
-
-      res.on("end", () => {
-        if (res.statusCode !== 200) {
-          resolve(null);
-          return;
-        }
-
-        try {
-          const parsed: UsageApiResponse = JSON.parse(data);
-          resolve(parsed);
-        } catch {
-          resolve(null);
-        }
-      });
+      dispatcher,
+      // Never carry the OAuth token to a redirect target.
+      redirect: "error",
+      signal: AbortSignal.timeout(USAGE_API_TIMEOUT_MS),
     });
-
-    req.on("error", () => {
-      resolve(null);
-    });
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(null);
-    });
-
-    req.end();
-  });
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      return null;
+    }
+    return (await response.json()) as UsageApiResponse;
+  } catch {
+    return null;
+  } finally {
+    await dispatcher?.destroy();
+  }
 }

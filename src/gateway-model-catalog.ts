@@ -1,8 +1,7 @@
-import { readFile } from "node:fs/promises";
-import { getCACertificates } from "node:tls";
-import { EnvHttpProxyAgent, fetch } from "undici";
+import { type EnvHttpProxyAgent, fetch } from "undici";
 import { z } from "zod";
 import type { EffortLevel, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import { createEnvHttpDispatcher } from "./env-http-dispatcher.js";
 
 // These are the levels accepted by the pinned Claude SDK, regardless of model brand.
 const effortLevelSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
@@ -98,28 +97,7 @@ export async function discoverGatewayModels(
     } else if (env.ANTHROPIC_API_KEY) {
       headers.set("x-api-key", env.ANTHROPIC_API_KEY);
     }
-    const tls = {
-      ...(env.NODE_EXTRA_CA_CERTS
-        ? {
-            ca: [...getCACertificates("default"), await readFile(env.NODE_EXTRA_CA_CERTS, "utf8")],
-          }
-        : {}),
-      ...(env.CLAUDE_CODE_CLIENT_CERT ? { cert: await readFile(env.CLAUDE_CODE_CLIENT_CERT) } : {}),
-      ...(env.CLAUDE_CODE_CLIENT_KEY ? { key: await readFile(env.CLAUDE_CODE_CLIENT_KEY) } : {}),
-      ...(env.CLAUDE_CODE_CLIENT_KEY_PASSPHRASE
-        ? { passphrase: env.CLAUDE_CODE_CLIENT_KEY_PASSPHRASE }
-        : {}),
-    };
-    const proxy = env.https_proxy || env.HTTPS_PROXY || env.http_proxy || env.HTTP_PROXY || "";
-    dispatcher = new EnvHttpProxyAgent({
-      // Explicit empty values prevent fallback to another session's process env.
-      httpProxy: proxy,
-      httpsProxy: proxy,
-      noProxy: [env.no_proxy, env.NO_PROXY].filter(Boolean).join(",").replace(/\s+/g, ","),
-      connect: tls,
-      requestTls: tls,
-      proxyTls: tls,
-    });
+    dispatcher = await createEnvHttpDispatcher(env);
     const models = new Map<string, ModelInfo>();
     const cursors = new Set<string>();
     let bytes = 0;
