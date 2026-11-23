@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { fetch } from "undici";
+import { describe, expect, it, vi } from "vitest";
 import {
   accountingDelta,
+  fetchUsageApi,
   getUsage,
   resultUsageIncrement,
   toAccountingModelUsage,
@@ -183,5 +188,29 @@ describe("OAuth usage windows", () => {
     await usage({ ...shared, limits: [scoped("Fable", 50)] });
     const next = await usage(shared);
     expect(next?.rateLimits[0]?.windows).toHaveLength(2);
+  });
+
+  it("sends the usage request through the configured proxy", async () => {
+    // network-setup.ts stubs undici's fetch; this test talks only to a loopback proxy.
+    const undici = await vi.importActual<typeof import("undici")>("undici");
+    vi.mocked(fetch).mockImplementationOnce(undici.fetch);
+    const tunnels: string[] = [];
+    const proxy = createServer();
+    proxy.on("connect", (request, socket) => {
+      tunnels.push(String(request.url));
+      socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+    });
+    proxy.listen(0, "127.0.0.1");
+    await once(proxy, "listening");
+    try {
+      const { port } = proxy.address() as AddressInfo;
+      const result = await fetchUsageApi("synthetic-test-token", {
+        HTTPS_PROXY: `http://127.0.0.1:${port}`,
+      });
+      expect(result).toBeNull();
+      expect(tunnels).toEqual(["api.anthropic.com:443"]);
+    } finally {
+      proxy.close();
+    }
   });
 });
