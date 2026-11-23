@@ -12683,10 +12683,10 @@ export class ClaudeAcpAgent {
       `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${resolvedProvider?.baseUrl ?? "native"}`,
     );
 
-    // Both forms of native subagent sessions report the configuration of a child.
-    const subagentConfigHook = subagentForm(this.clientCapabilities)
-      ? this.subagentConfigurationHook(sessionId)
-      : undefined;
+    const subagentConfigHook =
+      subagentForm(this.clientCapabilities) || supportsLodySubagentEvents(this.clientCapabilities)
+        ? this.subagentConfigurationHook(sessionId)
+        : undefined;
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],

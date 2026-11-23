@@ -100,7 +100,8 @@ root-scoped `_lody/subagents/event` envelope. Legacy clients retain their existi
 native or task-metadata path. Child permission tools are namespaced on the root
 connection; normalized runs do not advertise cancellation or output-tail queries.
 Live child history is retained by Lody, not replayed into the parent's transcript.
-The subagent event contract and helper are supplied by Core 0.1.9.
+Run snapshots carry the model reported in child responses and model switches,
+and the reasoning effort reported by child SDK hooks when available.
 
 The adapter advertises versioned capabilities under
 `agentCapabilities._meta.lody` using the contracts from `acp-extension-core`.
