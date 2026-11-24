@@ -16,7 +16,12 @@ import {
   type ListSessionsRequest,
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk/unstable";
-import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  archiveSession,
+  getSessionInfo,
+  unarchiveSession,
+  type Query,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
@@ -42,6 +47,7 @@ import {
 } from "./list-subscriptions.js";
 import {
   archiveInsteadOfDelete,
+  sessionNotFound,
   deleteSessionIfStored,
   archiveTo,
   renameTo,
@@ -268,6 +274,23 @@ export class SessionIndexConnection {
     return {};
   }
 
+  async setLodyArchived(sessionId: string, archived: boolean): Promise<EmptyResponse> {
+    const sessions = this.host.agent.sessions;
+    if (
+      sessions[sessionId] ||
+      Object.values(sessions).some((session) => session.nativeSessionId === sessionId)
+    ) {
+      throw RequestError.invalidRequest(
+        { sessionId },
+        "Close the session before archiving or restoring it",
+      );
+    }
+    if (!(await getSessionInfo(sessionId))) throw sessionNotFound(sessionId);
+    if (archived) await archiveSession(sessionId);
+    else await unarchiveSession(sessionId);
+    return {};
+  }
+
   /** `_session/archive`: hides a session from the default list and stops
    *  it. Idempotent; the session need not be loaded. A session loaded here
    *  is interrupted, retitled through its CLI while that still runs, then
@@ -388,14 +411,16 @@ export class SessionIndexConnection {
     if (this.service) {
       await this.service.delete(params.sessionId, loaded);
     } else if (this.host.isAirClient()) {
-      await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
+      await archiveInsteadOfDelete(params.sessionId, this.archiveWriter());
     } else {
       await deleteSessionIfStored(params.sessionId);
     }
     return {};
   }
 
-  private airArchiver(): SessionIndexService {
+  /** The negotiated index when present, so Core archives share its per-session mutation queue. */
+  private archiveWriter(): SessionIndexService {
+    if (this.service) return this.service;
     this.archiver ??= new SessionIndexService({
       logError: (message, error) =>
         this.host.agent.logger.error(`[session-index] ${message}:`, error),
@@ -503,3 +528,5 @@ export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexM
       (ctx) => agent().unarchiveSession(ctx.params),
     );
 }
+
+export { parseSessionIdRequest } from "./service.js";

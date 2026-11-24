@@ -50,11 +50,6 @@ import {
 } from "./session-doubles.js";
 import { Pushable } from "../utils.js";
 
-vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof fs>();
-  return { ...actual, readdir: vi.fn(actual.readdir) };
-});
-
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
   return {
@@ -62,6 +57,23 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(actual.deleteSession),
     getSessionInfo: vi.fn(actual.getSessionInfo),
     listSessions: vi.fn(actual.listSessions),
+  };
+});
+
+/** Holds a transcript append whose records `hold` returns a promise for. */
+const appendGate = vi.hoisted(() => ({
+  hold: undefined as ((data: string) => Promise<void> | undefined) | undefined,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readdir: vi.fn(actual.readdir),
+    appendFile: async (...args: Parameters<typeof actual.appendFile>) => {
+      await appendGate.hold?.(String(args[1]));
+      return actual.appendFile(...args);
+    },
   };
 });
 
@@ -1227,6 +1239,91 @@ describe("session/list of a sessionIndex client", () => {
       amount: 0.5,
       currency: "USD",
     });
+  });
+});
+
+describe("Core archive without AIR negotiation", () => {
+  it.each([false, true])(
+    "preserves the transcript and toggles the SDK archive flag with v2=%s",
+    async (v2) => {
+      const transcript = await writeTranscript({});
+      const before = await fs.readFile(transcript.file, "utf8");
+      const { agent } = createAgent({ v2 });
+      const initialized = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      expect(initialized.agentCapabilities?._meta).toMatchObject({
+        lody: { sessionArchive: { version: 1, mode: "native" } },
+      });
+      for (const archived of [true, true, false, false]) {
+        await agent.setLodySessionArchived(transcript.id, archived);
+        expect(
+          (await listSessions()).find((row) => row.sessionId === transcript.id)?.archived,
+        ).toBe(archived);
+        expect(await fs.readFile(transcript.file, "utf8")).toBe(before);
+      }
+      await agent.dispose();
+    },
+  );
+
+  it.each([false, true])(
+    "refuses a live native session after ACP identity rotation=%s",
+    async (rotated) => {
+      const transcript = await writeTranscript({});
+      const { agent } = createAgent();
+      await initializeClient(agent, {});
+      const active = runningSession({}, agent, transcript.id);
+      const acpId = rotated ? randomUUID() : transcript.id;
+      active.nativeSessionId = transcript.id;
+      agent.sessions[acpId] = active;
+      const before = await fs.readFile(transcript.file, "utf8");
+      for (const archived of [true, false]) {
+        await expect(agent.setLodySessionArchived(transcript.id, archived)).rejects.toMatchObject({
+          code: -32600,
+        });
+      }
+      expect(agent.sessions[acpId]).toBe(active);
+      expect(await fs.readFile(transcript.file, "utf8")).toBe(before);
+      await agent.dispose();
+    },
+  );
+
+  it("preserves a concurrent AIR rename during native archive", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    let renameRead!: () => void;
+    const read = new Promise<void>((resolve) => (renameRead = resolve));
+    let releaseRename!: () => void;
+    const released = new Promise<void>((resolve) => (releaseRename = resolve));
+    // The rename has read the title and holds its append.
+    appendGate.hold = (data) => {
+      if (!data.includes('"Renamed"')) return undefined;
+      appendGate.hold = undefined;
+      renameRead();
+      return released;
+    };
+    try {
+      const rename = agent.renameSessionTitle({ sessionId: session.id, title: "Renamed" });
+      await read;
+      const archive = agent.setLodySessionArchived(session.id, true);
+      releaseRename();
+      await Promise.all([rename, archive]);
+      expect((await getSessionInfo(session.id))?.customTitle).toBe("Renamed");
+      expect((await listSessions()).find((row) => row.sessionId === session.id)?.archived).toBe(
+        true,
+      );
+    } finally {
+      appendGate.hold = undefined;
+      releaseRename();
+      await agent.dispose();
+    }
+  });
+
+  it("rejects a missing transcript rather than creating history", async () => {
+    const { agent } = createAgent();
+    await initializeClient(agent, {});
+    await expect(agent.setLodySessionArchived(randomUUID(), true)).rejects.toMatchObject({
+      code: -32002,
+    });
+    await agent.dispose();
   });
 });
 

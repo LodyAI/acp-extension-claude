@@ -320,3 +320,7 @@ Standard `systemPrompt` takes precedence over legacy `_meta.systemPrompt` and
 AIR instructions. Changing the value on an idle load/resume rebuilds the native
 query; a busy session rejects the change. Omitting it uses the normal legacy/default
 configuration. Existing conversation history is unchanged.
+
+## Native session archive
+
+Core session archive v1 uses the local Claude SDK archive flag and preserves the transcript and title.
