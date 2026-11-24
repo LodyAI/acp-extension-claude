@@ -100,7 +100,7 @@ root-scoped `_lody/subagents/event` envelope. Legacy clients retain their existi
 native or task-metadata path. Child permission tools are namespaced on the root
 connection; normalized runs do not advertise cancellation or output-tail queries.
 Live child history is retained by Lody, not replayed into the parent's transcript.
-The subagent event contract and helper are supplied by Core 0.1.9.
+The subagent event contract and helper are supplied by Core 0.4.0.
 
 The adapter advertises versioned capabilities under
 `agentCapabilities._meta.lody` using the contracts from `acp-extension-core`.
@@ -291,7 +291,7 @@ neither guesses a turn nor filters by the latest prompt. Delivery does not hold
 prompt completion and never becomes assistant text. Silence is not an error.
 
 This integration uses the prompt-suggestion contract from the pinned
-`acp-extension-core@0.3.0` dependency.
+`acp-extension-core@0.4.0` dependency.
 
 ## Client system prompts
 
