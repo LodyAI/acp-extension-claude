@@ -128,7 +128,10 @@ patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
 - Agent message updates expose the top-level Claude SDK assistant uuid as
   `_meta.lody.turnId`. `_meta.lody.forkAtTurn.turnId` returns that value unchanged
-  and passes it directly to `resumeSessionAt`; do not maintain a message-id mapping.
+  and passes it directly to `resumeSessionAt` while it is on the active chain. A
+  turn that ended before the latest compaction is not, so `resolveTurnForkSource`
+  copies the transcript up to it with the SDK's `forkSession({ upToMessageId })`.
+  Do not maintain a message-id mapping.
 
 ## Subagent events
 

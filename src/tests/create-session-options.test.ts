@@ -818,7 +818,17 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
-  it("uses the Claude turn id supplied by Lody directly", async () => {
+  it("uses the Claude turn id supplied by Lody directly when it is on the active chain", async () => {
+    sessionMessages = [
+      {
+        type: "assistant",
+        uuid: "22222222-2222-4222-8222-222222222222",
+        session_id: "11111111-1111-4111-8111-111111111111",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "assistant", content: [{ type: "text", text: "Answer" }] },
+      },
+    ];
     await agent.unstable_forkSession({
       sessionId: "11111111-1111-4111-8111-111111111111",
       cwd: process.cwd(),
