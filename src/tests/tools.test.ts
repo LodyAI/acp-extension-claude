@@ -1,8 +1,17 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { ClientCapabilities } from "@agentclientprotocol/sdk";
+import { resolveSkillPath, type SkillScanCache } from "../tool-calls/reporters/interaction.js";
+import { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
   BetaMCPToolResultBlock,
@@ -2439,6 +2448,18 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
   });
 });
 
+describe("toolInfoFromToolUse - EnterPlanMode", () => {
+  it("reports a mode switch", () => {
+    const info = toolInfoFromToolUse(
+      { name: "EnterPlanMode", id: "toolu_enter", input: {} },
+      false,
+    );
+
+    expect(info.kind).toBe("switch_mode");
+    expect(info.title).toBe("EnterPlanMode");
+  });
+});
+
 describe("toolInfoFromToolUse - Write input aliases", () => {
   it.each([
     ["path + file_text", { path: "/repo/a.ts", file_text: "x" }],
@@ -2663,6 +2684,102 @@ describe("toAcpNotifications - TodoWrite with undefined input regression", () =>
     const planUpdates = notifications.filter((n) => (n.update as any).sessionUpdate === "plan");
     expect(planUpdates).toHaveLength(1);
   });
+
+  it.each([
+    {
+      todos: [{ content: "Do X", status: "pending", activeForm: "Doing X" }],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: {
+          type: "items",
+          planId: "plan",
+          entries: [{ content: "Do X", status: "pending", priority: "medium" }],
+        },
+      },
+    },
+    { todos: [], expected: { sessionUpdate: "plan_removed", planId: "plan" } },
+  ])(
+    "sends $todos.length todos as a plan operation to a client with plan operations",
+    ({ todos, expected }) => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: { todos } }],
+        "assistant",
+        "test-session",
+        {},
+        mockClient,
+        mockLogger,
+        { clientCapabilities: { plan: {} } },
+      );
+
+      expect(notifications.map(({ update }) => update)).toEqual([expected]);
+    },
+  );
+
+  const subagentTodos = [{ content: "Do Y", status: "pending", activeForm: "Doing Y" }];
+  const subagentEntries = [{ content: "Do Y", status: "pending", priority: "medium" }];
+  const subagentMeta = { claudeCode: { parentToolUseId: "toolu_agent" } };
+
+  it.each([
+    {
+      client: "a client with plan operations",
+      clientCapabilities: { plan: {} },
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan:toolu_agent", entries: subagentEntries },
+        _meta: subagentMeta,
+      },
+      shownAfter: ["plan:toolu_agent"],
+    },
+    {
+      client: "a client with plan operations",
+      clientCapabilities: { plan: {} },
+      todos: [],
+      shownBefore: ["plan:toolu_agent", "plan:toolu_other"],
+      expected: { sessionUpdate: "plan_removed", planId: "plan:toolu_agent", _meta: subagentMeta },
+      shownAfter: ["plan:toolu_other"],
+    },
+    {
+      // The update goes to the subagent's own session, which holds no other checklist.
+      client: "a client with native subagent sessions",
+      clientCapabilities: { plan: {}, subagents: {} },
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: "plan", entries: subagentEntries },
+        _meta: subagentMeta,
+      },
+      shownAfter: [],
+    },
+    {
+      // The client holds one plan per session.
+      client: "a client without plan operations",
+      clientCapabilities: {},
+      todos: subagentTodos,
+      shownBefore: [],
+      expected: { sessionUpdate: "plan", entries: subagentEntries, _meta: subagentMeta },
+      shownAfter: [],
+    },
+  ])(
+    "sends $todos.length todos of a subagent to $client",
+    ({ clientCapabilities, todos, shownBefore, expected, shownAfter }) => {
+      const shown = new Set(shownBefore);
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: { todos } }],
+        "assistant",
+        "test-session",
+        {},
+        mockClient,
+        mockLogger,
+        { clientCapabilities, parentToolUseId: "toolu_agent", subagentChecklists: shown },
+      );
+
+      expect(notifications.map(({ update }) => update)).toEqual([expected]);
+      expect([...shown]).toEqual(shownAfter);
+    },
+  );
 });
 
 describe("parseTaskCreateOutput", () => {
@@ -2714,6 +2831,19 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
       subject: "Write tests",
       status: "pending",
       activeForm: "Writing tests",
+      description: "Cover Task* flow",
+    });
+  });
+
+  it("takes the subject and description from the output, which holds the task as saved", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(
+      state,
+      { subject: "Write tsets", description: "Cover Task*", activeForm: "Writing tests" },
+      { task: { id: "1", subject: "Write tests", description: "Cover Task* flow" } },
+    );
+    expect(state.get("1")).toMatchObject({
+      subject: "Write tests",
       description: "Cover Task* flow",
     });
   });
@@ -2888,6 +3018,59 @@ describe("toAcpNotifications - Task* tools", () => {
     expect(notifications).toHaveLength(0);
     expect(taskState.size).toBe(0);
   });
+
+  // Claude Code shares one task list between the agents of a session, so a
+  // subagent's Task* call shows the same checklist as the main conversation's.
+  it.each([
+    { caller: "the main conversation", parentToolUseId: undefined, meta: {} },
+    {
+      caller: "a subagent",
+      parentToolUseId: "toolu_agent",
+      meta: { _meta: { claudeCode: { parentToolUseId: "toolu_agent" } } },
+    },
+  ])(
+    "sends the task snapshot of $caller as the checklist plan operation to a client with plan operations",
+    ({ parentToolUseId, meta }) => {
+      const toolUseCache: ToolUseCache = {
+        "1": { type: "tool_use", id: "1", name: "TaskCreate", input: { subject: "First" } },
+      };
+      const subagentChecklists = new Set<string>();
+      const created = toAcpNotifications(
+        [
+          {
+            type: "tool_result",
+            tool_use_id: "1",
+            content: JSON.stringify({ task: { id: "1", subject: "First" } }),
+            is_error: false,
+          },
+        ] as any,
+        "user",
+        "test-session",
+        toolUseCache,
+        mockClient,
+        mockLogger,
+        {
+          taskState: new Map(),
+          clientCapabilities: { plan: {} },
+          parentToolUseId,
+          subagentChecklists,
+        },
+      );
+
+      expect(created.map(({ update }) => update)).toEqual([
+        {
+          sessionUpdate: "plan_update",
+          plan: {
+            type: "items",
+            planId: "plan",
+            entries: [{ content: "First", status: "pending", priority: "medium" }],
+          },
+          ...meta,
+        },
+      ]);
+      expect(subagentChecklists.size).toBe(0);
+    },
+  );
 
   it("emits a plan snapshot after a TaskCreate tool_result and accumulates state", () => {
     const toolUseCache: ToolUseCache = {};
@@ -3820,6 +4003,92 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("reports an interrupted command as cancelled to a v2 client, and as completed to every other client", () => {
+    const status = (interrupted: boolean, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [{ type: "tool_result", tool_use_id: "toolu_bash", content: "partial" }] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolUseResult: { stdout: "partial", stderr: "", interrupted, isImage: false },
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status(true, v2)).toMatchObject({ status: "cancelled" });
+    expect(status(false, v2)).toMatchObject({ status: "completed" });
+    // v1 has no cancelled status.
+    expect(status(true)).toMatchObject({ status: "completed" });
+    expect(status(true, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "completed",
+    });
+  });
+
+  it("closes a tool call that Claude dropped before it ran as cancelled on v2, and as failed elsewhere", () => {
+    const unfinished = (ran: boolean, capabilities?: ToolCallCapabilities) =>
+      new AcpToolCallRenderer(capabilities).unfinished({ toolCallId: "toolu_bash", ran });
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(unfinished(false, v2)).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "cancelled",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "Claude stopped this tool call before it ran." },
+        },
+      ],
+    });
+    // A tool that ran but returned no result failed, also on v2.
+    expect(unfinished(true, v2)).toMatchObject({
+      status: "failed",
+      content: [
+        {
+          content: { text: "Claude ended the turn without returning a result for this tool." },
+        },
+      ],
+    });
+    // v1 has no cancelled status.
+    expect(unfinished(false)).toMatchObject({ status: "failed" });
+    expect(unfinished(false, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  it("ends the terminal of a command that gets no result, for a client that renders terminals", () => {
+    const terminalExit = (name: string, capabilities?: ToolCallCapabilities) =>
+      new AcpToolCallRenderer(capabilities).terminalExit({
+        id: "toolu_bash",
+        name,
+        input: { command: "make" },
+      });
+    const zed = ToolCallCapabilities.from({ _meta: { terminal_output: true } });
+    const airWithTerminal = ToolCallCapabilities.from({
+      _meta: { ...AIR_CLIENT._meta, terminal_output: true },
+    });
+    const exit = (exitCode: number | null) => ({
+      terminal_exit: { terminal_id: "toolu_bash", exit_code: exitCode, signal: null },
+    });
+
+    // The command ended without a result, so no exit code is known.
+    expect(terminalExit("Bash", zed)).toEqual(exit(null));
+    expect(terminalExit("PowerShell", zed)).toEqual(exit(null));
+    // A v2 client renders terminals without declaring them.
+    expect(terminalExit("Bash", ToolCallCapabilities.from({}, { v2: true }))).toEqual(exit(null));
+    // AIR always gets a number, and reads 1 for a command that did not succeed.
+    expect(terminalExit("Bash", airWithTerminal)).toEqual(exit(1));
+    // No terminal was started for these tool calls.
+    expect(terminalExit("Bash")).toBeUndefined();
+    expect(terminalExit("Bash", ToolCallCapabilities.from(AIR_CLIENT))).toBeUndefined();
+    expect(terminalExit("Read", zed)).toBeUndefined();
+    expect(terminalExit("mcp__server__tool", zed)).toBeUndefined();
+  });
+
   it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
     // TodoWrite renders as a plan, so only the permission flow emits its tool call.
     const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };
@@ -4495,21 +4764,54 @@ describe("Skill tool rendering", () => {
       )?._meta?.jetbrains?.air?.skill;
 
     let root: string;
+    let home: string;
+    let realHome: string | undefined;
 
     beforeEach(() => {
       root = mkdtempSync(path.join(tmpdir(), "acp-skill-path-"));
+      // A miss scans the user-level containers, so the real home of whoever runs this must stay out of it.
+      home = path.join(root, "home");
+      mkdirSync(home, { recursive: true });
+      realHome = process.env.HOME;
+      process.env.HOME = home;
     });
 
     afterEach(() => {
+      if (realHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = realHome;
+      }
       rmSync(root, { recursive: true, force: true });
     });
 
-    const writeSkill = (relativeDir: string) => {
+    const writeSkill = (relativeDir: string, declaredName?: string) => {
       const dir = path.join(root, relativeDir);
       mkdirSync(dir, { recursive: true });
       const file = path.join(dir, "SKILL.md");
-      writeFileSync(file, "# skill\n");
+      writeFileSync(
+        file,
+        declaredName ? `---\nname: ${declaredName}\n---\n# skill\n` : "# skill\n",
+      );
       return file;
+    };
+
+    /** A skill whose whole `SKILL.md` is given, for the frontmatter spellings `writeSkill` cannot express. */
+    const writeSkillFile = (relativeDir: string, content: string) => {
+      const dir = path.join(root, relativeDir);
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, content);
+      return file;
+    };
+
+    // The skill directory is outside the container, so only a link into the container can hold it.
+    const linkSkill = (relativeLink: string, declaredName?: string) => {
+      const file = writeSkill(`external/${relativeLink.replaceAll("/", "-")}-target`, declaredName);
+      const link = path.join(root, relativeLink);
+      mkdirSync(path.dirname(link), { recursive: true });
+      symlinkSync(path.dirname(file), link);
+      return path.join(link, "SKILL.md");
     };
 
     it("resolves a project-level .claude/skills skill", () => {
@@ -4540,6 +4842,171 @@ describe("Skill tool rendering", () => {
     it("omits the path when the session has no cwd", () => {
       writeSkill(".claude/skills/commits");
       expect(skillMeta("commits").path).toBeUndefined();
+    });
+
+    it("resolves a skill whose directory name differs from its declared name", () => {
+      const file = writeSkill(".claude/skills/rubymine", "rubymine-workflows");
+      expect(skillMeta("rubymine-workflows", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill whose link name differs from its declared name", () => {
+      const file = linkSkill(".claude/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill of .agents/skills by its declared name", () => {
+      const file = linkSkill(".agents/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("prefers the directory that carries the name when its file declares no name", () => {
+      const byName = writeSkill(".claude/skills/commits");
+      writeSkill(".agents/skills/other", "commits");
+      expect(skillMeta("commits", root).path).toBe(byName);
+    });
+
+    it("prefers the file that declares the name over a directory of that name declaring another", () => {
+      writeSkill(".claude/skills/commits", "git-commits");
+      const declared = writeSkill(".agents/skills/other", "commits");
+      expect(skillMeta("commits", root).path).toBe(declared);
+    });
+
+    it("omits the path when the directory of that name belongs to another skill", () => {
+      writeSkill(".claude/skills/commits", "git-commits");
+      expect(skillMeta("commits", root)).toEqual({ name: "commits" });
+    });
+
+    it("resolves a directory-scoped skill by its declared name", () => {
+      const file = writeSkill("apps/web/.claude/skills/deployment", "deploy");
+      expect(skillMeta("apps/web:deploy", root).path).toBe(file);
+    });
+
+    it("resolves a plugin skill by its declared name", () => {
+      const file = writeSkill(".claude/plugins/reviewer/skills/auditor", "audit");
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("ignores a name that the frontmatter does not declare", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("rubymine-workflows", root)).toEqual({ name: "rubymine-workflows" });
+    });
+
+    it("picks up a declared name that changed after the first resolution", () => {
+      const file = writeSkill(".claude/skills/commits", "commits");
+      expect(skillMeta("renamed", root).path).toBeUndefined();
+      writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
+      utimesSync(file, new Date(), new Date(Date.now() + 2000));
+      expect(skillMeta("renamed", root).path).toBe(file);
+    });
+
+    it("picks up a rewrite that restored the modification time of the file", () => {
+      const file = writeSkill(".claude/skills/commits", "commits");
+      const stamp = new Date(Math.floor(Date.now() / 1000) * 1000);
+      utimesSync(file, stamp, stamp);
+      const before = statSync(file).mtimeMs;
+      expect(skillMeta("renamed", root).path).toBeUndefined();
+      // The rename keeps the length of the file, so only the inode change time tells the two apart.
+      writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
+      // `git checkout`, `cp -p`, and a filesystem of one-second time resolution all leave the same trace.
+      utimesSync(file, stamp, stamp);
+      expect(statSync(file).mtimeMs).toBe(before);
+      expect(skillMeta("renamed", root).path).toBe(file);
+    });
+
+    it("resolves a user-level skill by its declared name", () => {
+      const dir = path.join(home, ".claude/skills/rubymine");
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, "---\nname: rubymine-workflows\n---\n# skill\n");
+      expect(skillMeta("rubymine-workflows", root).path).toBe(file);
+    });
+
+    it("resolves a marketplace plugin skill by its declared name", () => {
+      const file = writeSkill(
+        ".claude/plugins/marketplaces/official/plugins/reviewer/skills/auditor",
+        "audit",
+      );
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("gives one name to the same skill on every machine", () => {
+      const first = writeSkill(".claude/skills/a-first", "commits");
+      writeSkill(".claude/skills/z-last", "commits");
+      expect(skillMeta("commits", root).path).toBe(first);
+    });
+
+    it("leaves a prompt command of .claude/commands unresolved", () => {
+      writeSkill(".agents/skills/other", "deploy");
+      mkdirSync(path.join(root, ".claude/commands"), { recursive: true });
+      writeFileSync(path.join(root, ".claude/commands/deploy.md"), "# prompt\n");
+      expect(skillMeta("deploy", root)).toEqual({ name: "deploy" });
+    });
+
+    it("keeps a name that escapes its container off the filesystem", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("../commits", root).path).toBeUndefined();
+      expect(skillMeta("..:commits", root).path).toBeUndefined();
+      expect(skillMeta("a/b", root).path).toBeUndefined();
+    });
+
+    // One list of slash commands is resolved in one pass, and the containers are listed once for the whole
+    // pass rather than once per command.
+    it("lists a container once for the whole resolution pass", () => {
+      const scans: SkillScanCache = new Map();
+      writeSkill(".claude/skills/holder", "first");
+      expect(resolveSkillPath("first", root, scans)).toBe(
+        path.join(root, ".claude/skills/holder/SKILL.md"),
+      );
+      const added = writeSkill(".claude/skills/later", "second");
+      expect(resolveSkillPath("second", root, scans)).toBeUndefined();
+      expect(resolveSkillPath("second", root)).toBe(added);
+    });
+
+    describe("frontmatter", () => {
+      const resolves = (content: string, name = "commits") => {
+        const file = writeSkillFile(".claude/skills/holder", content);
+        return skillMeta(name, root).path === file;
+      };
+
+      it("reads a quoted name", () => {
+        expect(resolves('---\nname: "commits"\n---\n')).toBe(true);
+      });
+
+      it("reads a name with a trailing comment", () => {
+        expect(resolves("---\nname: commits # the one\n---\n")).toBe(true);
+      });
+
+      it("keeps a hash that starts no comment", () => {
+        expect(resolves("---\nname: c#1\n---\n", "c#1")).toBe(true);
+      });
+
+      it("reads a name written with CRLF line endings", () => {
+        expect(resolves("---\r\nname: commits\r\n---\r\n")).toBe(true);
+      });
+
+      it("reads a name of a block that ends with ...", () => {
+        expect(resolves("---\nname: commits\n...\n")).toBe(true);
+      });
+
+      it("ignores a value that no space separates from the key", () => {
+        expect(resolves("---\nname:commits\n---\n")).toBe(false);
+      });
+
+      it("ignores a name nested under another key", () => {
+        expect(resolves("---\nmetadata:\n  name: commits\n---\n")).toBe(false);
+      });
+
+      it("ignores a name below the frontmatter", () => {
+        expect(resolves("---\ndescription: d\n---\nname: commits\n")).toBe(false);
+      });
+
+      it("ignores a file with no frontmatter", () => {
+        expect(resolves("name: commits\n")).toBe(false);
+      });
+
+      it("ignores a name past the frontmatter the reader covers", () => {
+        expect(resolves(`---\ndescription: ${"d".repeat(9000)}\nname: commits\n---\n`)).toBe(false);
+      });
     });
   });
 });
@@ -4608,5 +5075,122 @@ describe("NotebookEdit", () => {
     expect(notifications[0].update).toMatchObject({ status: "completed" });
     expect(notifications[0].update).not.toHaveProperty("content");
     expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+});
+
+// A plan that the user approves through ExitPlanMode becomes the session's
+// markdown plan for a client that supports plan operations.
+describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  /** The plan updates for the result of an ExitPlanMode call with `input`. */
+  function planUpdates(
+    result: Record<string, unknown> = {},
+    options: Parameters<typeof toAcpNotifications>[6] = {},
+    input: Record<string, unknown> = { plan: "Implement it", planFilePath: "/plans/p.md" },
+  ) {
+    return toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          content: "User has approved your plan. You can now start coding.",
+          ...result,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_plan: { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input } },
+      mockClient,
+      mockLogger,
+      { clientCapabilities: { plan: {} }, ...options },
+    )
+      .filter(({ update }) => update.sessionUpdate === "plan_update")
+      .map(({ update }) => update);
+  }
+
+  const markdownPlan = (content: string, planId = "plan-mode") => ({
+    sessionUpdate: "plan_update",
+    plan: { type: "markdown", planId, content },
+  });
+
+  it("shows the plan of the structured result, which includes the user's edits", () => {
+    const toolUseResult = { plan: "Implement it carefully", isAgent: false, planWasEdited: true };
+    expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it carefully")]);
+  });
+
+  it("shows the plan of the input, trimmed, when there is no structured result, as on replay", () => {
+    expect(planUpdates({}, {}, { plan: "\nImplement it\n" })).toEqual([
+      markdownPlan("Implement it"),
+    ]);
+  });
+
+  it("shows the plan of the input when the structured result has none", () => {
+    const toolUseResult = { plan: null, isAgent: false };
+    expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it")]);
+  });
+
+  it.each([false, true])("links an AIR plan by ID with planFile=%s", (planFile) => {
+    const clientCapabilities: ClientCapabilities = {
+      plan: {},
+      _meta: {
+        jetbrains: { air: { version: 1, capabilities: planFile ? ["planFile"] : [] } },
+      },
+    };
+    expect(
+      planUpdates(
+        {},
+        { clientCapabilities, toolUseResult: { plan: "Edited plan", isAgent: false } },
+      ),
+    ).toEqual([markdownPlan("Edited plan", "plan-mode:toolu_plan")]);
+    expect(planUpdates({}, { clientCapabilities }, { plan: "\nOriginal plan\n" })).toEqual([
+      markdownPlan("Original plan", "plan-mode:toolu_plan"),
+    ]);
+  });
+
+  it("shows the plan after the tool call's result", () => {
+    const toolUseResult = { plan: "Implement it", isAgent: false };
+    const kinds = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "toolu_plan", content: "Approved." }] as any,
+      "user",
+      "test-session",
+      {
+        toolu_plan: {
+          type: "tool_use",
+          id: "toolu_plan",
+          name: "ExitPlanMode",
+          input: { plan: "Implement it" },
+        },
+      },
+      mockClient,
+      mockLogger,
+      { clientCapabilities: { plan: {} }, toolUseResult },
+    ).map(({ update }) => update.sessionUpdate);
+    expect(kinds).toEqual(["tool_call_update", "plan_update"]);
+  });
+
+  it("shows nothing to a client without plan operations", () => {
+    expect(planUpdates({}, { clientCapabilities: {} })).toEqual([]);
+  });
+
+  it("shows nothing for a plan the user rejected", () => {
+    expect(planUpdates({ is_error: true, content: "The user chose to keep planning." })).toEqual(
+      [],
+    );
+  });
+
+  it("shows nothing for a subagent's plan", () => {
+    expect(planUpdates({}, { parentToolUseId: "toolu_agent" })).toEqual([]);
+    expect(planUpdates({}, { toolUseResult: { plan: "Implement it", isAgent: true } })).toEqual([]);
+  });
+
+  it("shows nothing for a plan that waits for its team lead", () => {
+    const toolUseResult = { plan: "Implement it", isAgent: false, awaitingLeaderApproval: true };
+    expect(planUpdates({}, { toolUseResult })).toEqual([]);
+  });
+
+  it("shows nothing for an empty plan", () => {
+    expect(planUpdates({}, {}, { plan: "  " })).toEqual([]);
   });
 });

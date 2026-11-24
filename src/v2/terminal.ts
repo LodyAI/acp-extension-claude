@@ -11,8 +11,8 @@
  * extension (`ToolCallClientCapabilities.from`), and {@link V2Terminals} turns
  * the extension's keys into those updates.
  */
-import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 
 type V1ToolCallReport =
   | (ToolCall & { sessionUpdate: "tool_call" })
@@ -36,7 +36,10 @@ const TERMINAL_KEYS = [
 /** The terminal updates of the tool call reports of one v2 connection. */
 export class V2Terminals {
   /** The terminal and the last reported command of each running command, by session and tool call. */
-  private readonly running = new Map<string, { terminalId: string; command?: string }>();
+  private readonly running = new Map<
+    string,
+    { terminalId: string; command?: string; cancellable?: boolean }
+  >();
 
   /**
    * The terminal updates that a tool call report carries in the extension's
@@ -73,6 +76,8 @@ export class V2Terminals {
                   ...(exit.exit_code != null ? { exitCode: exit.exit_code } : {}),
                   ...(exit.signal != null ? { signal: exit.signal } : {}),
                 },
+                // An exited terminal can no longer be cancelled.
+                ...(running.cancellable ? { capabilities: null } : {}),
               }
             : {}),
         });
@@ -89,6 +94,30 @@ export class V2Terminals {
     return { terminal, report: withoutTerminalKeys(report) };
   }
 
+  /**
+   * The `terminal_update` that lets the client cancel the running terminal
+   * `terminalId` of the session `sessionId` with `terminal/cancel`, with its
+   * command, or undefined when the terminal is not running. `again` sends it
+   * also when the terminal advertises the capability already, as the current
+   * state of the terminal.
+   */
+  advertiseCancel(
+    sessionId: string,
+    terminalId: string,
+    again = false,
+  ): v2.SessionUpdate | undefined {
+    // The agent names a command's terminal after its tool call.
+    const running = this.running.get(`${sessionId} ${terminalId}`);
+    if (!running || (running.cancellable && !again)) return undefined;
+    running.cancellable = true;
+    return {
+      sessionUpdate: "terminal_update",
+      terminalId,
+      ...(running.command !== undefined ? { command: running.command } : {}),
+      capabilities: { cancel: {} },
+    };
+  }
+
   /** Forgets the terminals of a session. */
   forget(sessionId: string): void {
     for (const key of this.running.keys()) {
@@ -100,9 +129,8 @@ export class V2Terminals {
 /**
  * The report without the extension's keys, or undefined when it carried
  * nothing else but `_meta`: the output report of a command carries the output
- * alone, and only the stamps that every report of the tool call repeats. In v2
- * a concrete `_meta` replaces the stored one, so sending them would drop the
- * other keys that the tool call holds.
+ * alone, and only the stamps that every report of the tool call repeats. The
+ * client already holds those stamps, so the report goes without them.
  */
 function withoutTerminalKeys(report: V1ToolCallReport): V1ToolCallReport | undefined {
   if (!report._meta || !TERMINAL_KEYS.some((key) => key in report._meta!)) return report;

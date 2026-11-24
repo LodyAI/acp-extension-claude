@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deriveActivity, selectCost } from "../session-index/activity.js";
-import { LiveSessionRegistry } from "../session-index/live-registry.js";
+import { deriveActivity, selectCost, type ActivityState } from "../session-index/activity.js";
+import { LiveSessionRegistry, type LiveRecord } from "../session-index/live-registry.js";
 import {
   encodeProjectPath,
   isSessionId,
@@ -25,6 +25,7 @@ import {
   visibleTitle,
 } from "../session-index/archive-title.js";
 import {
+  agentWorktreeOf,
   continuedInSessionId,
   readHeadTail,
   scanTranscript,
@@ -35,7 +36,8 @@ import {
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
 import { DirListings, statFiles } from "../session-index/dir-listing.js";
-import { SessionIndex } from "../session-index/session-index.js";
+import { SessionIndex, type IndexRow } from "../session-index/session-index.js";
+import { changeSignature, sessionInfoOf } from "../session-index/session-info.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
@@ -211,11 +213,72 @@ describe("transcript scan", () => {
   });
 });
 
+describe("worktree-state records", () => {
+  const made = { worktreePath: "/wt", sessionId: SESSION };
+  const record = (worktreeSession: unknown) =>
+    JSON.stringify({ type: "worktree-state", worktreeSession, sessionId: SESSION });
+  const marked = record(made);
+
+  it("reads the last record: an object without enteredExisting marks", () => {
+    expect(agentWorktreeOf(lines(user("hi", "2026-01-01T00:00:00Z")))).toBeUndefined();
+    expect(agentWorktreeOf(marked)).toBe(true);
+    expect(agentWorktreeOf(record({ ...made, enteredExisting: false }))).toBe(true);
+    expect(agentWorktreeOf(record({ ...made, enteredExisting: true }))).toBe(false);
+    expect(agentWorktreeOf(`${marked}\n${record(null)}`)).toBe(false);
+    expect(agentWorktreeOf(`${record(null)}\n${marked}`)).toBe(true);
+  });
+
+  it("decides on a malformed latest record, and skips only lines that are no JSON", () => {
+    const missing = JSON.stringify({ type: "worktree-state", sessionId: SESSION });
+    for (const latest of [missing, record(null), record("wt"), record(1), record([made])]) {
+      expect(agentWorktreeOf(`${marked}\n${latest}`)).toBe(false);
+    }
+    // A cut line (the first of a window) or a broken one is no record.
+    const cut = record({ ...made, enteredExisting: true }).slice(8);
+    expect(cut.startsWith('"worktree-state"')).toBe(true);
+    expect(agentWorktreeOf(`${marked}\n${cut}`)).toBe(true);
+    expect(agentWorktreeOf(`${marked}\n{"type":"worktree-state",`)).toBe(true);
+  });
+});
+
+describe("change signature", () => {
+  it("is the same for an unmarked row as without the agentWorktree field", () => {
+    const row: IndexRow = {
+      sessionId: SESSION,
+      cwd: "/repo",
+      title: "Fix it",
+      updatedAtMs: Date.parse("2026-01-01T00:00:00Z"),
+      orderAtMs: Date.parse("2026-01-01T00:00:00Z"),
+      facts: { hasMessages: true, model: "claude-model-x", agentWorktree: false },
+      mtimeMs: Date.parse("2026-01-01T00:00:00Z"),
+      archived: false,
+    };
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const info = sessionInfoOf(row, undefined, undefined, now);
+    expect((info._meta as any).jetbrains.air).not.toHaveProperty("agentWorktree");
+    expect(changeSignature(info)).toBe(
+      JSON.stringify([SESSION, "/repo", "Fix it", info._meta ?? null]),
+    );
+    const markedInfo = sessionInfoOf({ ...row, agentWorktree: true }, undefined, undefined, now);
+    expect((markedInfo._meta as any).jetbrains.air.agentWorktree).toBe(true);
+    expect(changeSignature(markedInfo)).not.toBe(changeSignature(info));
+  });
+});
+
 describe("activity", () => {
   const now = Date.parse("2026-01-01T01:00:00Z");
   const facts = (overrides: Partial<TranscriptFacts> = {}): TranscriptFacts => ({
     hasMessages: true,
     ...overrides,
+  });
+  /** An interactive CLI that holds the session. */
+  const live = (status: string, entrypoint = "cli", statusUpdatedAt = now): LiveRecord => ({
+    pid: 1,
+    sessionId: "s",
+    kind: "interactive",
+    entrypoint,
+    status,
+    statusUpdatedAt,
   });
 
   it("reports the SDK state of a session this connection runs", () => {
@@ -262,14 +325,6 @@ describe("activity", () => {
     expect(again.lastTurnError).toBeUndefined();
     expect(deriveActivity({ facts: again, ...at })?.state).toBe("idle");
     // A busy or waiting CLI wins; an idle one shows the error.
-    const live = (status: string) => ({
-      pid: 1,
-      sessionId: "s",
-      kind: "interactive",
-      entrypoint: "cli",
-      status,
-      statusUpdatedAt: now,
-    });
     const held = { facts: errorFacts, transcriptMtimeMs: now - 1, now };
     expect(deriveActivity({ live: live("busy"), ...held })?.state).toBe("running");
     expect(deriveActivity({ live: live("waiting"), ...held })?.state).toBe("requires_action");
@@ -378,6 +433,34 @@ describe("activity", () => {
         facts: facts({ turnState: "unfinished" }),
       }),
     ).toBeUndefined();
+  });
+
+  // IJAI-3744
+  describe("with an open background task", () => {
+    const tasks = (open: string[]) => ({ open, stopCalls: [], complete: true });
+    const waiting = facts({ turnState: "finished", backgroundTasks: tasks(["task-1"]) });
+    /** A status older than the transcript, so the transcript decides. */
+    const held = live("busy", "cli", 1);
+    it.each<[string, LiveRecord, TranscriptFacts, ActivityState | undefined]>([
+      ["an SDK-driven CLI is busy", live("busy", "sdk-ts"), waiting, "running"],
+      ["an SDK-driven CLI is idle", live("idle", "sdk-ts"), waiting, "idle"],
+      ["a newer registry status is waiting", live("waiting"), waiting, "requires_action"],
+      ["a newer registry status is idle", live("idle"), waiting, "idle"],
+      ["the turn failed", held, { ...waiting, lastTurnError: true }, "running"],
+      // An unfinished turn that has not written for 10 minutes has no known state.
+      ["the turn is in progress", held, { ...waiting, turnState: "unfinished" }, undefined],
+      ["the task ended", held, { ...waiting, backgroundTasks: tasks([]) }, "idle"],
+    ])("when %s", (_, record, transcriptFacts, expected) => {
+      // The wait does not end after 10 minutes.
+      const transcriptMtimeMs = now - 11 * 60_000;
+      const state = deriveActivity({
+        live: record,
+        facts: transcriptFacts,
+        transcriptMtimeMs,
+        now,
+      })?.state;
+      expect(state).toBe(expected);
+    });
   });
 });
 

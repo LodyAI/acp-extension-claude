@@ -1,3 +1,4 @@
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { describe, expect, it, vi } from "vitest";
 import {
   ClearContextCoordinatorHost,
@@ -27,8 +28,10 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
       },
     },
     models: { currentModelId: "default" },
+    contextWindowSize: 200_000,
     configOptions: [],
     fastModeEnabled: false,
+    ultracodeEnabled: false,
     input: { push: vi.fn() },
     ...overrides,
   };
@@ -47,6 +50,7 @@ function testHost(
       return freshSession;
     }),
     applyFastMode: vi.fn(async () => {}),
+    applyUltracode: vi.fn(async () => {}),
     publishSessionState: vi.fn(async () => {}),
     continuationMessage: vi.fn((sessionId, plan, promptUuid) => ({
       type: "user" as const,
@@ -140,6 +144,9 @@ describe("continuePlanInFreshContext", () => {
         }),
       }),
     );
+    // Its echo carries the same human origin as a message typed in another
+    // client, so the fresh session must know the uuid is its own.
+    expect(freshSession.sentUserUuids).toEqual(new Set([turn.promptUuid]));
     expect(host.ensureConsumer).toHaveBeenCalledWith(freshSession, "public-session");
   });
 
@@ -244,6 +251,25 @@ describe("continuePlanInFreshContext", () => {
     expect(host.applyFastMode).toHaveBeenCalledWith(freshSession, false);
   });
 
+  it("restores ultracode turned on before clearing context", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({ activeTurn: turn, ultracodeEnabled: true });
+    const freshSession = testSession({ ultracodeEnabled: false });
+    const host = testHost(oldSession, freshSession);
+
+    await continuePlanInFreshContext(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
+      host,
+    );
+
+    expect(host.applyUltracode).toHaveBeenCalledWith(freshSession, true);
+  });
+
   it("does not publish or continue a restart cancelled while creating the fresh session", async () => {
     const turn: ClearContextTurn = {
       settled: false,
@@ -327,6 +353,8 @@ describe("ExitPlanCoordinator", () => {
     const host = {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
+      supportsPlanOperations: () => true,
+      isAirClient: () => false,
       destroyReplacement,
       settleCancelledTurn,
       settleFailedTurn: vi.fn(),
@@ -371,6 +399,8 @@ describe("ExitPlanCoordinator", () => {
     const host = {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
+      supportsPlanOperations: () => true,
+      isAirClient: () => false,
       destroyReplacement: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn,
@@ -379,12 +409,84 @@ describe("ExitPlanCoordinator", () => {
 
     await coordinator.restart("public-session", oldSession, reset);
 
+    // The plan was never carried out, so it does not become the session's plan.
+    expect(host.sessionUpdate).not.toHaveBeenCalled();
     expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
     expect(turn.carriedUsage).toBeUndefined();
     expect(turn.carriedModelUsage).toBeUndefined();
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);
+  });
+
+  it.each([
+    [
+      "publishes the approved plan after the session state, before the fresh context runs",
+      true,
+      false,
+    ],
+    ["links the approved AIR plan after a context reset", true, true],
+    ["publishes no plan to a client without plan operations", false, false],
+  ])("%s", async (_, supportsPlanOperations, airClient) => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const reset = { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" as const };
+    const oldSession = testSession({ activeTurn: turn, turnQueue: [turn] });
+    const freshSession = testSession();
+    const order: string[] = [];
+    const host = {
+      ...testHost(oldSession, freshSession),
+      sessionUpdate: vi.fn(async ({ update }: SessionNotification) => {
+        order.push(
+          update.sessionUpdate === "plan_update"
+            ? `plan_update ${JSON.stringify(update.plan)}`
+            : update.sessionUpdate,
+        );
+      }),
+      supportsPlanOperations: () => supportsPlanOperations,
+      isAirClient: () => airClient,
+      destroyReplacement: vi.fn(),
+      settleCancelledTurn: vi.fn(),
+      settleFailedTurn: vi.fn(),
+    };
+    vi.mocked(freshSession.input.push).mockImplementation(() => {
+      order.push("continuation");
+    });
+    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>(host);
+
+    await coordinator.restart("public-session", oldSession, reset);
+
+    expect(order).toEqual([
+      "current_mode_update",
+      "config_option_update",
+      "usage_update",
+      ...(supportsPlanOperations
+        ? [
+            "plan_update " +
+              JSON.stringify({
+                type: "markdown",
+                planId: airClient ? "plan-mode:tool-plan" : "plan-mode",
+                content: "Ship it",
+              }),
+          ]
+        : []),
+      "continuation",
+    ]);
+    expect(host.sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "public-session",
+      update: { sessionUpdate: "usage_update", used: 0, size: 200_000 },
+    });
+    if (airClient) {
+      expect(host.sessionUpdate).toHaveBeenCalledWith({
+        sessionId: "public-session",
+        update: {
+          sessionUpdate: "plan_update",
+          plan: { type: "markdown", planId: "plan-mode:tool-plan", content: "Ship it" },
+        },
+      });
+    }
   });
 });
 

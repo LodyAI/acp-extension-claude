@@ -37,8 +37,8 @@ describe("gateway model discovery", () => {
       first.status === "ready" &&
         first.models.map((m) => [m.value, m.displayName, m.supportsEffort]),
     ).toEqual([
-      ["auto/First", "auto/First", false],
-      ["grok/Second", "Second", false],
+      ["auto/First", "auto/First", undefined],
+      ["grok/Second", "Second", undefined],
     ]);
     vi.mocked(fetch).mockResolvedValue(reply({ data: [{ id: "devin/replacement" }] }));
     const next = await discoverGatewayModels(env, signal());
@@ -46,6 +46,89 @@ describe("gateway model discovery", () => {
       "devin/replacement",
     ]);
   });
+
+  it("preserves declared SDK effort levels without requiring a Claude model name", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      reply({
+        data: [
+          {
+            id: "vendor/reasoner",
+            supported_reasoning_levels: [
+              { effort: "low" },
+              { effort: "ultra" },
+              { effort: "high" },
+              { effort: "low" },
+              { effort: "xhigh" },
+              { effort: "max" },
+            ],
+          },
+          { id: "unknown" },
+          { id: "unsupported", supported_reasoning_levels: [{ effort: "minimal" }] },
+          { id: "malformed", supported_reasoning_levels: "invalid" },
+        ],
+      }),
+    );
+    const result = await discoverGatewayModels(env, signal());
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") throw new Error("Expected a catalog");
+    expect(
+      result.models.map(({ value, supportsEffort, supportedEffortLevels }) => ({
+        value,
+        supportsEffort,
+        supportedEffortLevels,
+      })),
+    ).toEqual([
+      {
+        value: "vendor/reasoner",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "high", "xhigh", "max"],
+      },
+      { value: "unknown", supportsEffort: undefined, supportedEffortLevels: undefined },
+      { value: "unsupported", supportsEffort: false, supportedEffortLevels: [] },
+      { value: "malformed", supportsEffort: undefined, supportedEffortLevels: undefined },
+    ]);
+  });
+
+  it("applies explicit effort overrides only to exact catalog IDs", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      reply({
+        data: [
+          { id: "vendor/reasoner", supported_reasoning_levels: [{ effort: "low" }] },
+          { id: "manual" },
+          { id: "manual-alias" },
+        ],
+      }),
+    );
+    const result = await discoverGatewayModels(
+      {
+        ...env,
+        CLAUDE_ACP_MODEL_EFFORTS: JSON.stringify({
+          "vendor/reasoner": [],
+          manual: ["high", "medium"],
+          removed: ["max"],
+        }),
+      },
+      signal(),
+    );
+    expect(
+      result.status === "ready" && result.models.map((m) => [m.value, m.supportedEffortLevels]),
+    ).toEqual([
+      ["vendor/reasoner", []],
+      ["manual", ["high", "medium"]],
+      ["manual-alias", undefined],
+    ]);
+  });
+
+  it.each(["not-json", '{"model":["ultra"]}', '{"model":"high"}'])(
+    "rejects invalid explicit overrides without echoing their values",
+    async (override) => {
+      await expect(
+        discoverGatewayModels({ ...env, CLAUDE_ACP_MODEL_EFFORTS: override }, signal()),
+      ).rejects.toThrow(
+        "Invalid CLAUDE_ACP_MODEL_EFFORTS: expected model IDs mapped to SDK effort arrays",
+      );
+    },
+  );
 
   it("uses API-key auth and preserves an existing v1 path", async () => {
     vi.mocked(fetch).mockImplementation(async (url, options) => {
@@ -114,7 +197,7 @@ describe("gateway model discovery", () => {
 
   it.each([
     {},
-    { ANTHROPIC_BASE_URL: "https://api.anthropic.com" },
+    { ANTHROPIC_BASE_URL: "https://api.anthropic.com", CLAUDE_ACP_MODEL_EFFORTS: "invalid" },
     { ...env, CLAUDE_CODE_USE_VERTEX: "1" },
     { ...env, CLAUDE_ACP_MODEL_DISCOVERY: "off" },
   ])("leaves native/disabled discovery alone", async (input) => {

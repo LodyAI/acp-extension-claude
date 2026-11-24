@@ -1,4 +1,4 @@
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   type ClearContextCoordinatorHost,
@@ -126,6 +126,45 @@ export function isExitPlanInterruptionResult(
   );
 }
 
+/** The base ID of an approved plan. AIR appends the review ID to keep each
+ * approval in the transcript. Other clients replace one plan per session.
+ * The TodoWrite checklist is a separate plan. */
+export const PLAN_MODE_PLAN_ID = "plan-mode";
+
+/** The plan, trimmed, that a successful ExitPlanMode result approved: the plan
+ * of the structured `output`, which includes the user's edits, else the plan
+ * that Claude Code adds to the tool's `input`. Replay has only the input: the
+ * SDK's `getSessionMessages` drops the structured output that the transcript
+ * keeps. Undefined for a subagent's plan, one that waits for its team lead
+ * (both only known from the output), and an empty plan. */
+export function approvedPlan(input: unknown, output: unknown): string | undefined {
+  const result = output as
+    { plan?: unknown; isAgent?: unknown; awaitingLeaderApproval?: unknown } | undefined;
+  if (result?.isAgent === true || result?.awaitingLeaderApproval === true) return undefined;
+  const plan =
+    typeof result?.plan === "string"
+      ? result.plan
+      : (input as { plan?: unknown } | undefined)?.plan;
+  return typeof plan === "string" && plan.trim() !== "" ? plan.trim() : undefined;
+}
+
+/** The update that shows an approved plan to a client that supports plan
+ * operations (the `plan` client capability, which every v2 client has).
+ * For AIR, pass the review ID to join the plan to its approval card. */
+export function planModeUpdate(
+  plan: string,
+  reviewToolCallId?: string,
+): SessionNotification["update"] {
+  return {
+    sessionUpdate: "plan_update",
+    plan: {
+      type: "markdown",
+      planId: reviewToolCallId ? `${PLAN_MODE_PLAN_ID}:${reviewToolCallId}` : PLAN_MODE_PLAN_ID,
+      content: plan,
+    },
+  };
+}
+
 /** Claude wraps a rejected ExitPlanMode explanation in a Markdown code fence.
  * Strip exactly one complete outer fence for that tool only. */
 export function exitPlanModeRawOutput(toolName: string, content: unknown): unknown {
@@ -144,6 +183,9 @@ export type ExitPlanRestartHost<
   "publishSessionState" | "continuationMessage"
 > & {
   sessionUpdate(notification: SessionNotification): Promise<void>;
+  /** Whether the client takes plan operations (see planModeUpdate). */
+  supportsPlanOperations(): boolean;
+  isAirClient(): boolean;
   destroyReplacement(sessionId: string, session: Session): void;
   settleCancelledTurn(oldSession: Session, turnSession: Session, turn: Turn): void;
   settleFailedTurn(turnSession: Session, turn: Turn, error: unknown): void;
@@ -171,7 +213,7 @@ export class ExitPlanCoordinator<
     try {
       const clearContextHost: ClearContextCoordinatorHost<Session, Turn> = {
         ...this.host,
-        publishSessionState: async (id, mode, configOptions) => {
+        publishSessionState: async (id, mode, configOptions, contextWindowSize) => {
           await this.host.sessionUpdate({
             sessionId: id,
             update: { sessionUpdate: "current_mode_update", currentModeId: mode },
@@ -180,6 +222,24 @@ export class ExitPlanCoordinator<
             sessionId: id,
             update: { sessionUpdate: "config_option_update", configOptions },
           });
+          // Otherwise the client shows the old context's usage until the fresh
+          // context first reports its own.
+          await this.host.sessionUpdate({
+            sessionId: id,
+            update: { sessionUpdate: "usage_update", used: 0, size: contextWindowSize },
+          });
+          // The approved plan becomes the session's plan once the fresh
+          // context that carries it out exists. Its ExitPlanMode ended with
+          // an error result, so toAcpNotifications did not publish it.
+          if (this.host.supportsPlanOperations()) {
+            await this.host.sessionUpdate({
+              sessionId: id,
+              update: planModeUpdate(
+                reset.plan,
+                this.host.isAirClient() ? reset.toolUseId : undefined,
+              ),
+            });
+          }
         },
         continuationMessage: (id, plan, promptUuid) => ({
           type: "user",

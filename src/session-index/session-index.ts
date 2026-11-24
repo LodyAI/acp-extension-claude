@@ -26,6 +26,8 @@ import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,
   encodeProjectPath,
+  errorCode,
+  exists,
   isExactProjectDir,
   isSessionId,
   normalizePath,
@@ -52,16 +54,21 @@ import {
   type SdkTitles,
   type TranscriptFacts,
 } from "./transcript-scan.js";
+import { searchBackgroundTasks } from "./background-tasks.js";
 import { DirListings, statFiles } from "./dir-listing.js";
-import { worktreeCounterparts } from "./worktrees.js";
+import { isInLinkedWorktree, worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
+/** Discovery could not establish which sessions the store contains. */
+export class SessionStoreUnavailableError extends Error {}
 /** Entries of the metadata cache: a few hundred bytes each, so the
  *  transcripts of a large history (tens of thousands) stay cached and deep
  *  pages do not read them again. */
 const METADATA_CACHE_SIZE = 50_000;
 const READ_BATCH_SIZE = 16;
+/** Session ids looked up together by {@link SessionIndex.getSessions}. */
+const LOOKUP_CHUNK_SIZE = 100;
 /** Transcripts read at most per directory to recover a sibling's cwd. */
 const MAX_CWD_PROBES_PER_DIR = 64;
 /** How long a directory that gave no cwd is not probed again. */
@@ -96,6 +103,24 @@ export type TranscriptCandidate = {
   ino: number;
 };
 
+type TranscriptFile = Pick<
+  TranscriptCandidate,
+  "sessionId" | "filePath" | "dirName" | "projectPath"
+>;
+
+/** Non-empty transcript files, with bounded stats shared by lists and id lookups. */
+async function transcriptCandidates(
+  files: readonly TranscriptFile[],
+): Promise<TranscriptCandidate[]> {
+  const stats = await statFiles(files.map(({ filePath }) => filePath));
+  return files.flatMap((file, i) => {
+    const current = stats[i];
+    return current?.isFile() && current.size > 0
+      ? [{ ...file, mtimeMs: current.mtimeMs, size: current.size, ino: current.ino }]
+      : [];
+  });
+}
+
 /** The cached metadata of one transcript. */
 type TranscriptMetadata = {
   /** The visible title: without the archive prefix. */
@@ -125,6 +150,10 @@ export type IndexRow = {
   facts: TranscriptFacts;
   mtimeMs: number;
   archived: boolean;
+  /** The session runs in a linked git worktree that Claude Code made for
+   *  it: its transcript says so (`facts.agentWorktree`) and `cwd` lies in
+   *  a linked worktree. See {@link markAgentWorktrees}. */
+  agentWorktree?: true;
 };
 
 /** A keyset position: the order key and the session id of the last row. */
@@ -247,6 +276,22 @@ function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
     facts: metadata.facts,
     mtimeMs: candidate.mtimeMs,
   };
+}
+
+/**
+ * Sets `agentWorktree` on the rows whose transcript says Claude Code made
+ * their worktree and whose cwd lies in a linked worktree now. Only those rows
+ * are checked; the check is not cached, so a removed worktree shows at once.
+ */
+async function markAgentWorktrees(rows: IndexRow[]): Promise<IndexRow[]> {
+  await Promise.all(
+    rows.map(async (row) => {
+      if (row.facts.agentWorktree === true && (await isInLinkedWorktree(row.cwd))) {
+        row.agentWorktree = true;
+      }
+    }),
+  );
+  return rows;
 }
 
 function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
@@ -380,7 +425,15 @@ function scopeOf(
   };
 }
 
+export type SessionIndexOptions = {
+  /** Whether a live process holds the session. Only for such a session the
+   *  whole transcript is searched for its background tasks. */
+  isLive?: (sessionId: string) => Promise<boolean>;
+};
+
 export class SessionIndex {
+  constructor(private readonly options: SessionIndexOptions = {}) {}
+
   private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
   /** The metadata reads in flight, by path: a list and a subscription that
@@ -497,25 +550,16 @@ export class SessionIndex {
     const listed = await this.listings.namesOfAll(dirPaths);
     const files = dirs.flatMap(({ dirName, projectPath }, i) =>
       listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6))).map(
-        (name) => ({ name, filePath: path.join(root, dirName, name), dirName, projectPath }),
+        (name) => ({
+          sessionId: name.slice(0, -6),
+          filePath: path.join(root, dirName, name),
+          dirName,
+          projectPath,
+        }),
       ),
     );
-    const stats = await statFiles(files.map(({ filePath }) => filePath));
-    const all: TranscriptCandidate[] = [];
-    files.forEach(({ name, filePath, dirName, projectPath }, i) => {
-      const fileStats = stats[i];
-      if (!fileStats?.isFile() || fileStats.size === 0) return;
-      all.push({
-        sessionId: name.slice(0, -6),
-        filePath,
-        dirName,
-        projectPath,
-        mtimeMs: fileStats.mtimeMs,
-        size: fileStats.size,
-        ino: fileStats.ino,
-      });
-    });
-    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates: all };
+    const candidates = await transcriptCandidates(files);
+    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates };
   }
 
   /**
@@ -549,6 +593,90 @@ export class SessionIndex {
       }),
       sessionDirs: dirPaths.filter((_, i) => dirStats[i]?.isDirectory()),
     };
+  }
+
+  /** Known ids in request order, using the same rows as the list.
+   *  Addresses exact filenames; only rows without a cwd need sibling discovery. */
+  async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
+    if (sessionIds.length === 0) return [];
+    const root = projectsRoot();
+    let projectEntries: string[];
+    try {
+      projectEntries = await fs.readdir(root);
+    } catch (cause) {
+      if (errorCode(cause) === "ENOENT" && !(await exists(root))) {
+        return [];
+      }
+      throw new SessionStoreUnavailableError("Session store could not be read", { cause });
+    }
+    const ids = sessionIds.filter(isSessionId);
+    const byId = new Map<string, IndexRow>();
+    // Paths are project directories × ids: bound them per chunk, not per request.
+    for (let start = 0; start < ids.length; start += LOOKUP_CHUNK_SIZE) {
+      const chunk = ids.slice(start, start + LOOKUP_CHUNK_SIZE);
+      for (const row of await this.lookupRows(root, projectEntries, chunk)) {
+        byId.set(row.sessionId, row);
+      }
+    }
+    return sessionIds.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
+  }
+
+  /** The rows of `ids` found under `projectEntries`. All copies of an id are
+   *  in the same call, so copy selection is unchanged by chunking. */
+  private async lookupRows(
+    root: string,
+    projectEntries: readonly string[],
+    ids: readonly string[],
+  ): Promise<IndexRow[]> {
+    let candidates = await transcriptCandidates(
+      projectEntries.flatMap((dirName) =>
+        ids.map((sessionId) => ({
+          sessionId,
+          filePath: path.join(root, dirName, `${sessionId}.jsonl`),
+          dirName,
+        })),
+      ),
+    );
+    if (CASE_INSENSITIVE_PATHS) {
+      // On a case-insensitive file system, stat of `ABC.jsonl` also finds
+      // `abc.jsonl`. Keep a file only when its real name is the requested one,
+      // or differs by more than case (a symlink, as the list would read it).
+      // A failed realpath means the file is unreadable, so the id is omitted.
+      const exact = await Promise.all(
+        candidates.map(async ({ filePath }) => {
+          try {
+            const actual = path.basename(await fs.realpath(filePath));
+            const expected = path.basename(filePath);
+            return actual === expected || actual.toLowerCase() !== expected.toLowerCase();
+          } catch {
+            return false;
+          }
+        }),
+      );
+      candidates = candidates.filter((_, i) => exact[i]);
+    }
+    return this.collectRows(candidates.sort(byMtimeDescending), {
+      inScope: scopeOf(undefined),
+      archived: "all",
+      wanted: Infinity,
+      unread: async (read, dirNames) => {
+        const dirs = [...dirNames];
+        const listed = await this.listings.namesOfAll(dirs.map((dir) => path.join(root, dir)));
+        const siblings = dirs.flatMap((dirName, i) =>
+          listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6)))
+            .map((name) => ({
+              sessionId: name.slice(0, -6),
+              filePath: path.join(root, dirName, name),
+              dirName,
+            }))
+            .filter(({ filePath }) => !read.has(filePath)),
+        );
+        return (await transcriptCandidates(siblings)).sort(byMtimeDescending);
+      },
+    });
   }
 
   /** Every transcript file of `sessionId` (see {@link scanSession}). Empty
@@ -686,11 +814,14 @@ export class SessionIndex {
    * alone gives, read from it at once, and the ids of the sessions it gives
    * no answer for: a transcript of it has nothing cached at its stat, no cwd
    * known, or is continued in another session (whether the successor hides
-   * it depends on the successor now). Reads no transcript.
+   * it depends on the successor now). Reads no transcript. The rows carry
+   * `agentWorktree` ({@link markAgentWorktrees}, which reads git files)
+   * unless `mark` is false, for a caller that uses only their ids.
    */
   async cachedRowsOf(
     paths: readonly string[],
     candidates: readonly TranscriptCandidate[],
+    { mark = true }: { mark?: boolean } = {},
   ): Promise<{ rows: IndexRow[]; unknown: Set<string> }> {
     const unknown = new Set<string>();
     const resolved: { item: Resolved; cwd: string }[] = [];
@@ -721,7 +852,8 @@ export class SessionIndex {
       if (previous && previous.mtimeMs >= item.candidate.mtimeMs) continue;
       newest.set(id, { row: toRow(item, cwd), mtimeMs: item.candidate.mtimeMs });
     }
-    return { rows: [...newest.values()].map(({ row }) => row), unknown };
+    const rows = [...newest.values()].map(({ row }) => row);
+    return { rows: mark ? await markAgentWorktrees(rows) : rows, unknown };
   }
 
   /**
@@ -745,9 +877,12 @@ export class SessionIndex {
       archived: ArchivedFilter;
       after?: ListCursor;
       wanted: number;
-      /** The transcripts not read (by path), which may supply a sibling's
-       *  cwd. */
-      unread: (read: ReadonlySet<string>) => readonly TranscriptCandidate[];
+      /** The unread transcripts of the directories still eligible for cwd
+       *  recovery. Called only after checking the negative cache. */
+      unread?: (
+        read: ReadonlySet<string>,
+        dirNames: ReadonlySet<string>,
+      ) => readonly TranscriptCandidate[] | Promise<readonly TranscriptCandidate[]>;
       restat?: boolean;
     },
   ): Promise<IndexRow[]> {
@@ -819,19 +954,20 @@ export class SessionIndex {
       }
       await settlePending();
     }
-    if (pending.length > 0) {
+    const unread = options.unread;
+    if (pending.length > 0 && unread) {
       // A row recovered after the scan stopped still sorts into the page: it
       // was read before the stop, and more rows only raise the bound. A
       // sibling that the archive filter or the cursor leaves out may still
       // supply the cwd.
       await this.learnDirCwds(
         new Set(pending.map(({ candidate }) => candidate.dirName)),
-        options.unread(read),
+        (dirNames) => unread(read, dirNames),
         options.restat ?? false,
       );
       await settlePending();
     }
-    return rows();
+    return markAgentWorktrees(rows());
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -860,7 +996,9 @@ export class SessionIndex {
    *  changes. `restat` as in {@link collectRows}. */
   private async learnDirCwds(
     dirNames: ReadonlySet<string>,
-    unread: readonly TranscriptCandidate[],
+    unread: (
+      dirNames: ReadonlySet<string>,
+    ) => readonly TranscriptCandidate[] | Promise<readonly TranscriptCandidate[]>,
     restatFirst: boolean,
   ): Promise<void> {
     const root = projectsRoot();
@@ -876,8 +1014,9 @@ export class SessionIndex {
       if (known && known.mtimeMs === mtimeMs && now - known.at < NO_CWD_RETRY_MS) continue;
       mtimes.set(dirName, mtimeMs);
     }
+    if (mtimes.size === 0) return;
     const probes = new Map<string, number>();
-    let remaining = unread.filter((candidate) => {
+    let remaining = (await unread(new Set(mtimes.keys()))).filter((candidate) => {
       if (!mtimes.has(candidate.dirName)) return false;
       const count = probes.get(candidate.dirName) ?? 0;
       if (count >= MAX_CWD_PROBES_PER_DIR) return false;
@@ -968,14 +1107,15 @@ export class SessionIndex {
     this.reads++;
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
-    const facts = await scanTranscriptFile(
+    const scanned = await scanTranscriptFile(
       candidate.filePath,
       candidate.size,
       headTail,
       previous,
       candidate.ino,
     );
-    if (!facts.hasMessages) return null;
+    if (!scanned.hasMessages) return null;
+    const facts = await this.withAllBackgroundTasks(candidate, scanned);
     // The last relocation names the session's cwd, as the SDK reads it; the
     // messages before it keep the old one.
     const fileCwd = await this.recoverCwd(candidate.dirName, [
@@ -1006,6 +1146,24 @@ export class SessionIndex {
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
       facts,
     };
+  }
+
+  /**
+   * `facts` with the background tasks of the whole transcript, when the
+   * tasks of its tail are not complete: a task can start before the tail.
+   * Only a finished turn of a live session waits for the tasks, so only
+   * then the whole transcript is read.
+   */
+  private async withAllBackgroundTasks(
+    candidate: TranscriptCandidate,
+    facts: TranscriptFacts,
+  ): Promise<TranscriptFacts> {
+    if (facts.turnState !== "finished") return facts;
+    if (facts.backgroundTasks?.complete) return facts;
+    const isLive = await this.options.isLive?.(candidate.sessionId);
+    if (!isLive) return facts;
+    const backgroundTasks = await searchBackgroundTasks(candidate.filePath, candidate.size);
+    return { ...facts, backgroundTasks };
   }
 
   /**
