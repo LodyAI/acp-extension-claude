@@ -1264,22 +1264,27 @@ describe("Core archive without AIR negotiation", () => {
     },
   );
 
-  it("refuses an open runtime and preserves its transcript", async () => {
-    const transcript = await writeTranscript({});
-    const { agent } = createAgent();
-    await initializeClient(agent, {});
-    const active = runningSession({}, agent, transcript.id);
-    agent.sessions[transcript.id] = active;
-    const before = await fs.readFile(transcript.file, "utf8");
-    for (const archived of [true, false]) {
-      await expect(agent.setLodySessionArchived(transcript.id, archived)).rejects.toMatchObject({
-        code: -32600,
-      });
-    }
-    expect(agent.sessions[transcript.id]).toBe(active);
-    expect(await fs.readFile(transcript.file, "utf8")).toBe(before);
-    await agent.dispose();
-  });
+  it.each([false, true])(
+    "refuses a live native session after ACP identity rotation=%s",
+    async (rotated) => {
+      const transcript = await writeTranscript({});
+      const { agent } = createAgent();
+      await initializeClient(agent, {});
+      const active = runningSession({}, agent, transcript.id);
+      const acpId = rotated ? randomUUID() : transcript.id;
+      active.nativeSessionId = transcript.id;
+      agent.sessions[acpId] = active;
+      const before = await fs.readFile(transcript.file, "utf8");
+      for (const archived of [true, false]) {
+        await expect(agent.setLodySessionArchived(transcript.id, archived)).rejects.toMatchObject({
+          code: -32600,
+        });
+      }
+      expect(agent.sessions[acpId]).toBe(active);
+      expect(await fs.readFile(transcript.file, "utf8")).toBe(before);
+      await agent.dispose();
+    },
+  );
 
   it("preserves a concurrent AIR rename during native archive", async () => {
     const session = await writeTranscript({});

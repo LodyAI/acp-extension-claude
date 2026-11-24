@@ -275,7 +275,11 @@ export class SessionIndexConnection {
   }
 
   async setLodyArchived(sessionId: string, archived: boolean): Promise<EmptyResponse> {
-    if (this.host.agent.sessions[sessionId] !== undefined) {
+    const sessions = this.host.agent.sessions;
+    if (
+      sessions[sessionId] ||
+      Object.values(sessions).some((session) => session.nativeSessionId === sessionId)
+    ) {
       throw RequestError.invalidRequest(
         { sessionId },
         "Close the session before archiving or restoring it",
