@@ -12670,6 +12670,8 @@ export class ClaudeAcpAgent {
     }
     const env: Record<string, string | undefined> = {
       ...process.env,
+      // The native CLI passes its environment to project commands.
+      ELECTRON_RUN_AS_NODE: undefined,
       ...userProvidedOptions?.env,
       // Client-managed LLM routing: `providers/set` config wins, else the
       // legacy gateway auth request. Routing is baked into the query at

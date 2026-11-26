@@ -222,6 +222,17 @@ describe("providers", () => {
     expect(mockQuery.mock.results[0].value.close).not.toHaveBeenCalled();
   });
 
+  it("keeps Electron Node mode out of the native Claude CLI environment", async () => {
+    vi.stubEnv("ELECTRON_RUN_AS_NODE", "1");
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery.mock.calls[0][0].options.env.ELECTRON_RUN_AS_NODE).toBeUndefined();
+    expect(process.env.ELECTRON_RUN_AS_NODE).toBe("1");
+  });
+
   it("recreates loaded sessions with the new provider between turns", async () => {
     const [agent, mockQuery] = await createAgentMock();
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
