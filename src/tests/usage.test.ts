@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { fetch } from "undici";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountingDelta,
   fetchUsageApi,
@@ -11,6 +12,11 @@ import {
   toAccountingModelUsage,
   type UsageApiDeps,
 } from "../usage.js";
+
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  execFileSync: vi.fn(),
+}));
 
 const resetAt = "2026-09-07T00:00:00Z";
 const shared = {
@@ -212,5 +218,74 @@ describe("OAuth usage windows", () => {
     } finally {
       proxy.close();
     }
+  });
+});
+
+describe("macOS keychain credentials", () => {
+  const now = Date.parse("2026-09-05T00:00:00Z");
+  const platform = process.platform;
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    vi.stubEnv("USER", "current-user");
+  });
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: platform });
+    vi.unstubAllEnvs();
+  });
+
+  /** Fake `security find-generic-password -s "Claude Code-credentials" [-a <account>] -w`:
+   *  prints the first entry (with `-a`, the first one of that account), or exits
+   *  44 when there is none. */
+  const keychain = (entries: { account: string; token: string; expiresAt: number }[]) =>
+    vi.mocked(execFileSync).mockImplementation((_file, args = []) => {
+      const account = args.includes("-a") ? args[args.indexOf("-a") + 1] : undefined;
+      const entry = entries.find((e) => account === undefined || e.account === account);
+      if (!entry) {
+        throw Object.assign(new Error("The specified item could not be found in the keychain."), {
+          status: 44,
+        });
+      }
+      const oauth = {
+        accessToken: entry.token,
+        subscriptionType: "max",
+        expiresAt: entry.expiresAt,
+      };
+      return JSON.stringify({ claudeAiOauth: oauth });
+    });
+
+  it.each([
+    {
+      name: "uses the current account's entry when another account's entry comes first",
+      entries: [
+        { account: "previous-mac-user", token: "previous-token", expiresAt: now - 1 },
+        { account: "current-user", token: "current-token", expiresAt: now + 3_600_000 },
+      ],
+      sent: "current-token",
+    },
+    {
+      name: "falls back to the account-less lookup when the current account has no entry",
+      entries: [{ account: "other-user", token: "other-token", expiresAt: now + 3_600_000 }],
+      sent: "other-token",
+    },
+    {
+      name: "does not fall back past the current account's expired entry",
+      entries: [
+        { account: "other-user", token: "other-token", expiresAt: now + 3_600_000 },
+        { account: "current-user", token: "current-token", expiresAt: now - 1 },
+      ],
+      sent: undefined,
+    },
+  ])("$name", async ({ entries, sent }) => {
+    keychain(entries);
+    let sentToken: string | undefined;
+    await getUsage({
+      homeDir: () => "/synthetic-unused-home",
+      now: () => now,
+      fetchApi: async (accessToken) => {
+        sentToken = accessToken;
+        return shared;
+      },
+    });
+    expect(sentToken).toBe(sent);
   });
 });
